@@ -36,7 +36,7 @@ async fn run() -> Result<()> {
             let config = azs_uploader_core::distribution::ReleaseConfig::configured()?;
             println!(
                 "{}",
-                serde_json::json!({"catalogUrl":config.url,"keyIds":config.keys.keys().collect::<Vec<_>>()})
+                serde_json::json!({"catalogUrl":config.url,"keyIds":config.keys.keys().collect::<Vec<_>>(),"publicKeys":config.keys.iter().map(|(id,key)| (id.clone(), key.to_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>())).collect::<std::collections::BTreeMap<_,_>>()})
             );
             return Ok(());
         }

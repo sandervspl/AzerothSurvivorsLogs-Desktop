@@ -6,5 +6,5 @@ Do not submit source changes here. SOURCE_COMMIT identifies the upstream snapsho
 
 Download packages from this repository’s GitHub Releases. Releases are manually prepared.
 Build on Windows: `cargo build --release --locked --bin azs-uploader --bin azs-update-guard`.
-The release workflow defaults to publisher-signed managed installers; unsigned standalone EXEs require an explicit opt-out.
+The release workflow creates production managed installers. Windows publisher signing is optional; authenticated update metadata is always required.
 The signed update catalog lives on this mirror's separate updates branch. Publishing a versioned release does not promote that catalog.
