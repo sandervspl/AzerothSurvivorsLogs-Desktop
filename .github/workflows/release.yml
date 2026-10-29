@@ -5,16 +5,74 @@ on:
       tag:
         description: Release tag (desktop-vX.Y.Z)
         required: true
+      signed_installer:
+        description: Build a signed managed installer (requires publisher configuration)
+        type: boolean
+        default: false
 permissions:
   contents: write
+  id-token: write
 jobs:
   package:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate release version before building
+        shell: pwsh
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          if ($env:TAG -notmatch '^desktop-v\d+\.\d+\.\d+$') { throw 'Invalid desktop tag' }
+          $version = [regex]::Match((Get-Content Cargo.toml -Raw), '(?m)^version = "([^"]+)"').Groups[1].Value
+          if ($env:TAG -ne "desktop-v$version") { throw 'Tag must match Cargo version' }
+      - name: Require production trust and publisher configuration
+        if: inputs.signed_installer
+        shell: pwsh
+        env:
+          PUBLIC_KEYS: ${{ vars.AZS_RELEASE_PUBLIC_KEYS }}
+          SIGNING_METADATA: ${{ secrets.AZS_WINDOWS_SIGNING_METADATA }}
+        run: |
+          if (-not $env:PUBLIC_KEYS -or -not $env:SIGNING_METADATA) { throw 'Configure production trust keys and Azure signing metadata in this mirror first.' }
+          New-Item -ItemType Directory -Path .state -Force | Out-Null
+          $metadata = Join-Path $PWD '.state/windows-signing.json'
+          [IO.File]::WriteAllText($metadata, $env:SIGNING_METADATA)
+          "AZS_WINDOWS_SIGNING_METADATA=$metadata" >> $env:GITHUB_ENV
+          "AZS_RELEASE_PUBLIC_KEYS=$env:PUBLIC_KEYS" >> $env:GITHUB_ENV
+          'AZS_RELEASE_CATALOG_URL=https://downloads.azslogs.com/stable.json' >> $env:GITHUB_ENV
+      - uses: actions/setup-dotnet@v4
+        if: inputs.signed_installer
+        with:
+          dotnet-version: '8.0.x'
+      - uses: azure/login@v2
+        if: inputs.signed_installer
+        with:
+          client-id: ${{ vars.AZS_SIGNING_CLIENT_ID }}
+          tenant-id: ${{ vars.AZS_SIGNING_TENANT_ID }}
+          subscription-id: ${{ vars.AZS_SIGNING_SUBSCRIPTION_ID }}
       - name: Build standalone executables
+        if: ${{ !inputs.signed_installer }}
         run: cargo build --release --locked --bin azs-uploader --bin azs-update-guard
+      - name: Package and verify publisher-signed installer
+        if: inputs.signed_installer
+        shell: pwsh
+        run: |
+          dotnet tool install vpk --version 1.2.161 --tool-path .cache/vpk
+          if ($LASTEXITCODE -ne 0) { throw 'Velopack installation failed' }
+          ./scripts/package-managed-desktop.ps1 -Vpk .cache/vpk/vpk.exe
+      - name: Draft signed installer release
+        if: inputs.signed_installer
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          $source = Get-Content SOURCE_COMMIT
+          gh release create $env:TAG artifacts/desktop-release/*Setup.exe artifacts/desktop-release/*-full.nupkg artifacts/desktop-release/releases.stable.json artifacts/desktop-release/publisher-signature-verification.json --target $env:GITHUB_SHA --draft --title $env:TAG --notes "Publisher-signed Windows installer. Source monorepo commit: $source. Publishing this release does not update the authenticated update catalog."
       - name: Create draft for review
+        if: ${{ !inputs.signed_installer }}
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
