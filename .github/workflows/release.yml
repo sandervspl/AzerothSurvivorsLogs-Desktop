@@ -1,0 +1,27 @@
+name: Prepare standalone desktop download
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (desktop-vX.Y.Z)
+        required: true
+permissions:
+  contents: write
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build standalone executables
+        run: cargo build --release --locked --bin azs-uploader --bin azs-update-guard
+      - name: Create draft for review
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          if ($env:TAG -notmatch '^desktop-v\d+\.\d+\.\d+$') { throw 'Invalid desktop tag' }
+          $version = (Select-String '^version = "([^"]+)"' Cargo.toml).Matches.Groups[1].Value
+          if ($env:TAG -ne "desktop-v$version") { throw 'Tag must match Cargo version' }
+          $source = Get-Content SOURCE_COMMIT
+          gh release create $env:TAG target/release/azs-uploader.exe target/release/azs-update-guard.exe --target $env:GITHUB_SHA --draft --title $env:TAG --notes "Unsigned standalone Windows executables. Source monorepo commit: $source. Signed managed updates are distributed separately."

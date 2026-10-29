@@ -1,0 +1,32 @@
+[package]
+name = "azs-uploader-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+flate2.workspace = true
+sha2.workspace = true
+sha1 = "0.10"
+hmac = "0.12"
+base64 = "0.22"
+memchr = "2"
+rusqlite.workspace = true
+chrono.workspace = true
+ed25519-dalek = "=2.2.0"
+zip = { version = "=4.6.1", default-features = false, features = ["deflate-flate2"] }
+semver = "1"
+tempfile = "3"
+dunce = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp"] }
+
+[[bin]]
+name = "azs-upload"
+path = "src/main.rs"
