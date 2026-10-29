@@ -1,8 +1,10 @@
 pub mod client_build;
 pub mod distribution;
 pub mod game_process;
+pub mod monitoring;
 pub mod native_history;
 pub mod native_save;
+mod retention;
 mod run_filter;
 use anyhow::{Context, Result, bail};
 use flate2::{Compression, GzBuilder};
@@ -64,6 +66,7 @@ pub fn sha256(bytes: &[u8]) -> String {
 fn invalid_recording(error: &str) -> bool {
     error.starts_with("Processing failed: Wrong recorder file.")
         || error == "Processing failed: Missing run baseline"
+        || error.starts_with("No combat events match the recorder.")
 }
 
 fn recorder_header(mut bytes: &[u8]) -> bool {
@@ -100,6 +103,11 @@ impl Engine {
             "UPDATE jobs SET status = 'invalid' WHERE status = 'pending' AND (error LIKE 'Processing failed: Wrong recorder file.%' OR error = 'Processing failed: Missing run baseline')",
             [],
         )?;
+        let mut db = engine.db()?;
+        retention::initialize(&mut db)?;
+        if let Err(error) = retention::prune(&engine.state, &db) {
+            monitoring::capture(&error);
+        }
         Ok(engine)
     }
     fn db(&self) -> Result<Connection> {
@@ -335,9 +343,36 @@ impl Engine {
         let bytes = compressed.metadata()?.len();
         drop(compressed);
         let destination = self.state.join("spool").join(format!("{hash}.gz"));
+        let _spool_lock = distribution::lock(&self.state.join("spool/storage.lock"))?;
         if destination.exists() {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&destination)?
+                .set_modified(std::time::SystemTime::now())?;
             fs::remove_file(&temporary)?;
         } else {
+            let limit = std::env::var("AZS_SPOOL_LIMIT_BYTES")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(2 * 1024 * 1024 * 1024);
+            let mut used = 0u64;
+            for entry in fs::read_dir(self.state.join("spool"))? {
+                let entry = entry?;
+                if entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "gz")
+                {
+                    used = used.saturating_add(entry.metadata()?.len());
+                }
+            }
+            if used.saturating_add(bytes) > limit {
+                fs::remove_file(&temporary)?;
+                bail!(
+                    "Local saved recordings reached the storage limit. Existing recordings are preserved; resume saved uploads or choose another storage location before adding more."
+                );
+            }
             fs::rename(&temporary, &destination)?;
         }
         Ok(Source {
@@ -370,8 +405,9 @@ impl Engine {
         )?;
         let result = self.upload_inner(job, token, progress).await;
         if let Err(error) = &result {
+            monitoring::capture(error);
             self.db()?.execute(
-                "UPDATE jobs SET status = ?, error = ? WHERE id = ?",
+                "UPDATE jobs SET status = ?, error = ?, finished_at = ? WHERE id = ?",
                 params![
                     if invalid_recording(&error.to_string()) {
                         "invalid"
@@ -379,6 +415,11 @@ impl Engine {
                         "pending"
                     },
                     error.to_string(),
+                    if invalid_recording(&error.to_string()) {
+                        Some(chrono::Utc::now().timestamp_millis())
+                    } else {
+                        None
+                    },
                     job.id
                 ],
             )?;
@@ -394,8 +435,8 @@ impl Engine {
         let Some(filtered) = self.filter_job(job)? else {
             progress("No runs reached five minutes; no source files uploaded".into());
             self.db()?.execute(
-                "UPDATE jobs SET status = 'ready', error = NULL WHERE id = ?",
-                [&job.id],
+                "UPDATE jobs SET status = 'ready', error = NULL, finished_at = ? WHERE id = ?",
+                params![chrono::Utc::now().timestamp_millis(), job.id],
             )?;
             return Ok(json!({"status":"ready", "runs":[], "newRuns":[], "ignored":true}));
         };
@@ -478,8 +519,8 @@ impl Engine {
             .await?;
             if status["status"] == "ready" {
                 self.db()?.execute(
-                    "UPDATE jobs SET status = 'ready', error = NULL WHERE id = ?",
-                    [&job.id],
+                    "UPDATE jobs SET status = 'ready', error = NULL, finished_at = ? WHERE id = ?",
+                    params![chrono::Utc::now().timestamp_millis(), job.id],
                 )?;
                 progress("Report ready".into());
                 // Preserve the legacy result while distinguishing a completed re-upload.
@@ -520,22 +561,55 @@ impl Engine {
         let api = validate_api(api)?;
         for _ in 0..120 {
             tokio::time::sleep(Duration::from_secs(interval.max(1))).await;
-            let response = self.client.post(format!("{api}/api/auth/device/token")).json(&json!({"grant_type":"urn:ietf:params:oauth:grant-type:device_code","device_code":code,"client_id":"azs-uploader"})).send().await?;
+            let response = match self.client.post(format!("{api}/api/auth/device/token")).json(&json!({"grant_type":"urn:ietf:params:oauth:grant-type:device_code","device_code":code,"client_id":"azs-uploader"})).timeout(Duration::from_secs(15)).send().await {
+                Ok(response) => response,
+                Err(_) => { progress("Connection interrupted. Reconnecting automatically...".into()); continue; }
+            };
+            if response.status().is_server_error() || response.status().as_u16() == 429 {
+                progress(
+                    "Approval service temporarily unavailable. Retrying automatically...".into(),
+                );
+                continue;
+            }
             let status = response.status();
-            let body: Value = response.json().await?;
+            let body: Value = match response.json().await {
+                Ok(body) => body,
+                Err(_) => {
+                    progress("Approval response interrupted. Retrying automatically...".into());
+                    continue;
+                }
+            };
             if status.is_success() {
                 let session = body["access_token"]
                     .as_str()
                     .context("Missing approval token")?;
-                let registered = checked(
-                    self.client
+                let mut registered = None;
+                for _ in 0..30 {
+                    progress("Browser approved. Connecting your uploader...".into());
+                    let response = self
+                        .client
                         .post(format!("{api}/api/v1/devices"))
                         .bearer_auth(session)
                         .json(&json!({"name":"Azeroth Survivors Uploader"}))
+                        .timeout(Duration::from_secs(15))
                         .send()
-                        .await?,
-                )
-                .await?;
+                        .await;
+                    match response {
+                        Ok(response)
+                            if !response.status().is_server_error()
+                                && response.status().as_u16() != 429 =>
+                        {
+                            registered = Some(checked(response).await?);
+                            break;
+                        }
+                        _ => progress(
+                            "Connection interrupted. Finishing sign-in automatically...".into(),
+                        ),
+                    }
+                    tokio::time::sleep(Duration::from_secs(interval.max(1))).await;
+                }
+                let registered = registered
+                    .context("Could not finish connecting. Please try signing in again.")?;
                 return Ok(registered["token"]
                     .as_str()
                     .context("Missing scoped device credential")?

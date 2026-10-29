@@ -5,6 +5,15 @@ use std::{collections::HashMap, path::Path};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _sentry = azs_uploader_core::monitoring::init();
+    let result = run().await;
+    if let Err(error) = &result {
+        azs_uploader_core::monitoring::capture(error);
+    }
+    result
+}
+
+async fn run() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let command = args.next().unwrap_or_default();
     let mut options = HashMap::new();

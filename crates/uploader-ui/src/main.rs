@@ -1,4 +1,5 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+mod close_behavior;
 mod desktop_updates;
 mod game_process;
 mod setup;
@@ -20,12 +21,30 @@ enum Message {
     Setup(Box<setup::Snapshot>),
     GameState(game_process::State),
     Status(String),
+    Approval { code: String, url: String },
+    SignInFailed(String),
     SignedIn,
+    CloseChoice(bool),
+    SessionLoaded(bool),
     Account(String),
     Pending { generation: u64, count: usize },
     Finished(Vec<String>),
 }
 struct Uploader {
+    close_behavior: close_behavior::CloseBehavior,
+    close_prompt_open: bool,
+    session_loaded: bool,
+    setup_loaded: bool,
+    wheel_animation: Option<(std::time::Instant, Pixels, Pixels)>,
+    wheel_frame_pending: bool,
+    page_scroll: ScrollHandle,
+    scrollbar_drag: Option<Pixels>,
+    upload_attempted: bool,
+    visibility_bounds: std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
+    visibility_open: bool,
+    visibility_focus: FocusHandle,
+    public_upload: bool,
+    approval: Option<(String, String)>,
     api: String,
     state: PathBuf,
     combat: Option<PathBuf>,
@@ -83,9 +102,14 @@ impl Uploader {
                 std::thread::sleep(Duration::from_secs(1));
             }
         });
-        let signed_in = credential(&api)
-            .and_then(|c| c.get_password().map_err(Into::into))
-            .is_ok();
+        let session_api = api.clone();
+        let session_sender = sender.clone();
+        std::thread::spawn(move || {
+            let signed_in = credential(&session_api)
+                .and_then(|c| c.get_password().map_err(Into::into))
+                .is_ok();
+            let _ = session_sender.send(Message::SessionLoaded(signed_in));
+        });
         let poll = cx.spawn(async |this, cx| {
             loop {
                 cx.background_executor()
@@ -93,18 +117,24 @@ impl Uploader {
                     .await;
                 if this
                     .update(cx, |this, cx| {
+                        if let Some(quit) = close_behavior::tray_action() {
+                            if quit {
+                                azs_uploader::recovery::clean_exit(&this.state);
+                                cx.quit();
+                                return;
+                            }
+                            close_behavior::restore(cx);
+                        }
                         let request = this.state.join("open-request");
                         if request.exists() {
                             let _ = std::fs::remove_file(request);
-                            cx.activate(true);
-                            for window in cx.windows() {
-                                let _ = window.update(cx, |_, window, _| window.activate_window());
-                            }
+                            close_behavior::restore(cx);
                         }
                         while let Ok(message) = this.receiver.try_recv() {
                             match message {
                                 Message::DesktopStatus(status) => this.desktop_status = status,
                                 Message::Setup(snapshot) => {
+                                    this.setup_loaded = true;
                                     this.setup_busy = snapshot.busy;
                                     this.updates_paused = snapshot.paused;
                                     this.setup_status = snapshot.status;
@@ -140,13 +170,42 @@ impl Uploader {
                                 }
                                 Message::GameState(state) => this.game_state = state,
                                 Message::Status(text) => this.status = text,
+                                Message::Approval { code, url } => {
+                                    this.approval = Some((code, url))
+                                }
+                                Message::SignInFailed(error) => {
+                                    this.approval = None;
+                                    this.busy = false;
+                                    this.status = format!("Sign-in interrupted. {error}");
+                                }
                                 Message::SignedIn => {
+                                    this.approval = None;
                                     this.signed_in = true;
                                     this.refresh_pending();
                                     this.busy = false;
-                                    this.status =
-                                        "Signed in. Your recordings are discovered automatically."
-                                            .into();
+                                    this.status = "Signed in.".into();
+                                }
+                                Message::CloseChoice(to_tray) => {
+                                    this.close_prompt_open = false;
+                                    if this.close_behavior.save(&this.state, to_tray) {
+                                        if to_tray {
+                                            for handle in cx.windows() {
+                                                let _ = handle.update(cx, |_, window, _| {
+                                                    close_behavior::hide(window)
+                                                });
+                                            }
+                                        } else {
+                                            azs_uploader::recovery::clean_exit(&this.state);
+                                            cx.quit();
+                                        }
+                                    } else {
+                                        this.status = this.close_behavior.error.clone();
+                                    }
+                                }
+                                Message::SessionLoaded(signed_in) => {
+                                    this.signed_in = signed_in;
+                                    this.session_loaded = true;
+                                    this.refresh_pending();
                                 }
                                 Message::Account(owner) => this.owner = Some(owner),
                                 Message::Pending { generation, count } => {
@@ -180,15 +239,29 @@ impl Uploader {
             }
         });
         let native_monitor = None;
-        let mut uploader = Self {
+        Self {
+            close_behavior: close_behavior::CloseBehavior::load(&state),
+            close_prompt_open: false,
+            session_loaded: false,
+            setup_loaded: false,
+            wheel_animation: None,
+            wheel_frame_pending: false,
+            page_scroll: ScrollHandle::new(),
+            scrollbar_drag: None,
+            upload_attempted: false,
+            visibility_bounds: Default::default(),
+            visibility_open: false,
+            visibility_focus: cx.focus_handle(),
+            public_upload: true,
+            approval: None,
             api,
             state,
             combat,
             recorder,
-            status: "Your runs, ready for analysis.".into(),
+            status: String::new(),
             busy: false,
             game_state: game_process::State::Checking,
-            signed_in,
+            signed_in: false,
             reports: vec![],
             tab: Tab::Upload,
             show_help: false,
@@ -211,9 +284,7 @@ impl Uploader {
             manual_sources: false,
             desktop_status: "Uploader updates are checked automatically.".into(),
             health_reported: false,
-        };
-        uploader.refresh_pending();
-        uploader
+        }
     }
     fn refresh_pending(&mut self) {
         if !self.signed_in {
@@ -364,10 +435,164 @@ impl Uploader {
         }
         cx.notify();
     }
+    fn wheel_input(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let delta = event.delta.pixel_delta(window.line_height()).y;
+        let max = self.page_scroll.max_offset().height;
+        let current = self.page_scroll.offset().y;
+        let smooth = matches!(event.delta, ScrollDelta::Lines(lines) if lines.y.abs() >= 1. && lines.y.fract().abs() < 0.001)
+            && motion_enabled();
+        if !smooth {
+            self.wheel_animation = None;
+            self.page_scroll
+                .set_offset(point(px(0.), (current + delta).clamp(-max, px(0.))));
+        } else {
+            let base = self
+                .wheel_animation
+                .filter(|(_, _, target)| {
+                    (*target > current && delta > px(0.)) || (*target < current && delta < px(0.))
+                })
+                .map(|(_, _, target)| target)
+                .unwrap_or(current);
+            self.wheel_animation = Some((
+                std::time::Instant::now(),
+                current,
+                (base + delta).clamp(-max, px(0.)),
+            ));
+            self.schedule_wheel_frame(window, cx);
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+    fn schedule_wheel_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.wheel_frame_pending {
+            return;
+        }
+        self.wheel_frame_pending = true;
+        let entity = cx.entity();
+        window.on_next_frame(move |window, cx| {
+            entity.update(cx, |this, cx| {
+                this.wheel_frame_pending = false;
+                if let Some((started, from, target)) = this.wheel_animation {
+                    let t = (started.elapsed().as_secs_f32() / 0.14).min(1.);
+                    let eased = 1. - (1. - t).powi(3);
+                    let max = this.page_scroll.max_offset().height;
+                    this.page_scroll.set_offset(point(
+                        px(0.),
+                        (from + (target - from) * eased).clamp(-max, px(0.)),
+                    ));
+                    if t >= 1. {
+                        this.wheel_animation = None;
+                    } else {
+                        this.schedule_wheel_frame(window, cx);
+                    }
+                    cx.notify();
+                }
+            });
+        });
+        cx.notify();
+    }
+    fn page_scrollbar(&self, cx: &Context<Self>) -> AnyElement {
+        let viewport = self.page_scroll.bounds();
+        let height = viewport.size.height;
+        let max = self.page_scroll.max_offset().height;
+        if height <= px(0.) || max <= px(0.) {
+            return div().into_any_element();
+        }
+        let thumb_height = (height * (height / (height + max)))
+            .max(px(28.))
+            .min(height);
+        let travel = height - thumb_height;
+        let top = travel * (-self.page_scroll.offset().y / max).clamp(0., 1.);
+        let entity = cx.entity();
+        let handle = self.page_scroll.clone();
+        div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right_0()
+            .w(px(12.))
+            .bg(rgb(palette::HEADER))
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
+                this.wheel_input(event, window, cx)
+            }))
+            .child(
+                div()
+                    .absolute()
+                    .top(top)
+                    .left(px(3.))
+                    .w(px(6.))
+                    .h(thumb_height)
+                    .rounded_full()
+                    .bg(rgb(palette::MUTED)),
+            )
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, _| {
+                        window.on_mouse_event({
+                            let entity = entity.clone();
+                            let handle = handle.clone();
+                            move |event: &MouseDownEvent, phase, _, cx| {
+                                if phase != DispatchPhase::Bubble
+                                    || event.button != MouseButton::Left
+                                    || !bounds.contains(&event.position)
+                                {
+                                    return;
+                                }
+                                let y = event.position.y - bounds.origin.y;
+                                let inside = y >= top && y <= top + thumb_height;
+                                entity.update(cx, |this, cx| {
+                                    this.wheel_animation = None;
+                                    this.scrollbar_drag = inside.then_some(y - top);
+                                    if !inside {
+                                        let page = height * 0.9;
+                                        let offset =
+                                            handle.offset().y + if y < top { page } else { -page };
+                                        handle
+                                            .set_offset(point(px(0.), offset.clamp(-max, px(0.))));
+                                    }
+                                    cx.notify();
+                                });
+                            }
+                        });
+                        window.on_mouse_event({
+                            let entity = entity.clone();
+                            move |_: &MouseUpEvent, _, _, cx| {
+                                entity.update(cx, |this, _| this.scrollbar_drag = None);
+                            }
+                        });
+                        window.on_mouse_event(move |event: &MouseMoveEvent, _, _, cx| {
+                            if !event.dragging() || travel <= px(0.) {
+                                return;
+                            }
+                            entity.update(cx, |this, cx| {
+                                if let Some(grab) = this.scrollbar_drag {
+                                    handle.set_offset(point(
+                                        px(0.),
+                                        -max * ((event.position.y - bounds.origin.y - grab)
+                                            / travel)
+                                            .clamp(0., 1.),
+                                    ));
+                                    cx.notify();
+                                }
+                            });
+                        });
+                    },
+                )
+                .size_full(),
+            )
+            .into_any_element()
+    }
     fn login(&mut self, cx: &mut Context<Self>) {
         if self.busy {
             return;
         }
+        self.approval = None;
         self.busy = true;
         self.status = "Opening browser approval…".into();
         cx.notify();
@@ -383,22 +608,27 @@ impl Uploader {
                     let user_code = code["user_code"]
                         .as_str()
                         .ok_or_else(|| anyhow::anyhow!("Missing approval code"))?;
-                    tx.send(Message::Status(format!(
-                        "Approve this device in your browser. Code: {user_code}"
-                    )))
-                    .ok();
                     let url = code["verification_uri_complete"]
                         .as_str()
                         .or(code["verification_uri"].as_str())
                         .ok_or_else(|| anyhow::anyhow!("Missing approval URL"))?;
-                    open::that(url)?;
+                    tx.send(Message::Approval {
+                        code: user_code.to_string(),
+                        url: url.to_string(),
+                    })
+                    .ok();
+                    tx.send(Message::Status("Waiting for browser approval".into()))
+                        .ok();
+                    if open::that(url).is_err() {
+                        tx.send(Message::Status("Could not open your browser. Use Open browser to try again; approval is still waiting.".into())).ok();
+                    }
                     let token = engine
                         .authorize(
                             &api,
                             code["device_code"].as_str().unwrap_or(""),
                             code["interval"].as_u64().unwrap_or(5),
                             |s| {
-                                tx.send(Message::Status(format!("{s} · {user_code}"))).ok();
+                                tx.send(Message::Status(s.to_string())).ok();
                             },
                         )
                         .await?;
@@ -408,8 +638,7 @@ impl Uploader {
                 })
             })();
             if let Err(error) = result {
-                tx.send(Message::Status(error.to_string())).ok();
-                tx.send(Message::Finished(vec![])).ok();
+                tx.send(Message::SignInFailed(error.to_string())).ok();
             }
         });
     }
@@ -435,9 +664,15 @@ impl Uploader {
         self.reports.clear();
         self.tab = Tab::Upload;
         self.unseen_results = false;
+        self.upload_attempted = true;
         self.status = "Preparing a durable upload…".into();
         cx.notify();
         let api = self.api.clone();
+        let visibility = if self.public_upload {
+            "public"
+        } else {
+            "private"
+        };
         let state = self.state.clone();
         let combat = self.combat.clone();
         let recorder = self.recorder.clone();
@@ -473,7 +708,7 @@ impl Uploader {
                                     .map(|(save, exe)| (save.as_path(), exe.as_path())),
                                 year: chrono::Local::now().year(),
                                 offset: chrono::Local::now().offset().local_minus_utc() / 60,
-                                visibility: "public",
+                                visibility,
                             })?,
                         ]
                     };
@@ -520,6 +755,7 @@ impl Uploader {
                     tx.send(Message::Finished(reports)).ok();
                 }
                 Err(error) => {
+                    azs_uploader_core::monitoring::capture(&error);
                     tx.send(Message::Status(format!(
                         "{error}. Any saved unfinished uploads are kept on this computer."
                     )))
@@ -572,6 +808,92 @@ mod palette {
     pub const ACCENT_HOVER: u32 = 0xdf2b2b;
     pub const LINK: u32 = 0xffcc66;
 }
+fn visibility_globe() -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        |bounds, _, window, _| {
+            let center = bounds.center();
+            let mut builder = PathBuilder::stroke(px(1.3));
+            for width in [6., 2.7] {
+                for step in 0..=40 {
+                    let angle = step as f32 * std::f32::consts::TAU / 40.;
+                    let p = point(
+                        center.x + px(width * angle.cos()),
+                        center.y + px(6. * angle.sin()),
+                    );
+                    if step == 0 {
+                        builder.move_to(p);
+                    } else {
+                        builder.line_to(p);
+                    }
+                }
+            }
+            builder.move_to(point(center.x - px(6.), center.y));
+            builder.line_to(point(center.x + px(6.), center.y));
+            if let Ok(path) = builder.build() {
+                window.paint_path(path, rgb(palette::TEXT));
+            }
+        },
+    )
+    .w(px(16.))
+    .h(px(16.))
+    .flex_shrink_0()
+}
+fn motion_enabled() -> bool {
+    #[cfg(target_os = "windows")]
+    let animate = {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
+        };
+        let mut enabled = 0i32;
+        unsafe {
+            let _ = SystemParametersInfoW(
+                SPI_GETCLIENTAREAANIMATION,
+                0,
+                Some((&mut enabled as *mut i32).cast()),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            );
+        }
+        enabled != 0
+    };
+    #[cfg(not(target_os = "windows"))]
+    let animate = false;
+    animate
+}
+fn approval_spinner() -> AnyElement {
+    let animate = motion_enabled();
+    div()
+        .relative()
+        .w(px(16.))
+        .h(px(16.))
+        .flex_shrink_0()
+        .children((0usize..8).map(move |index| {
+            let angle = index as f32 * std::f32::consts::TAU / 8.;
+            let dot = div()
+                .absolute()
+                .left(px(6.5 + angle.sin() * 6.))
+                .top(px(6.5 - angle.cos() * 6.))
+                .w(px(3.))
+                .h(px(3.))
+                .rounded_full()
+                .bg(rgb(palette::MUTED));
+            if animate {
+                dot.with_animation(
+                    ("approval-spinner", index),
+                    Animation::new(Duration::from_secs(1)).repeat(),
+                    move |dot, progress| {
+                        dot.opacity(
+                            0.2 + 0.8 * (1. - (progress - index as f32 / 8.).rem_euclid(1.)),
+                        )
+                    },
+                )
+                .into_any_element()
+            } else {
+                dot.opacity(0.3 + index as f32 / 12.).into_any_element()
+            }
+        }))
+        .into_any_element()
+}
 impl Render for Uploader {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.health_reported {
@@ -583,6 +905,24 @@ impl Render for Uploader {
                 });
             });
         }
+        let scroll_entity = cx.entity();
+        let scroll_bounds = self.page_scroll.clone();
+        let wheel_capture = canvas(
+            |_, _, _| (),
+            move |_, _, window, _| {
+                window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+                    if phase == DispatchPhase::Capture
+                        && scroll_bounds.bounds().contains(&event.position)
+                        && !event.modifiers.shift
+                        && event.delta.pixel_delta(window.line_height()).y != px(0.)
+                    {
+                        scroll_entity.update(cx, |this, cx| this.wheel_input(event, window, cx));
+                    }
+                });
+            },
+        )
+        .absolute()
+        .size_full();
         use palette::*;
         let button = |id: &'static str, label: &str, primary: bool, enabled: bool| {
             div()
@@ -703,24 +1043,181 @@ impl Render for Uploader {
                         .child(action),
                 )
         };
-        let content = match self.tab {
-            Tab::Upload => div().flex().flex_col().gap_5()
+        let loading = !self.session_loaded || !self.setup_loaded;
+        let onboarding = loading || self.game_root.is_none() || !self.signed_in;
+        let content = if loading {
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .child(approval_spinner())
+                .child("Loading uploader...")
+                .into_any_element()
+        } else if onboarding {
+            let choose_folder = self.game_root.is_none();
+            div()
+                .flex()
+                .flex_col()
+                .gap_5()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child(if choose_folder {
+                            "Step 1 of 2: Game folder"
+                        } else {
+                            "Step 2 of 2: Sign in"
+                        }),
+                )
+                .child(div().text_2xl().child(if choose_folder {
+                    "Choose your game folder"
+                } else if self.approval.is_some() {
+                    "Enter this code in your browser"
+                } else {
+                    "Sign in to continue"
+                }))
+                .child(div().text_color(rgb(MUTED)).child(if choose_folder {
+                    "Select your Azeroth Survivors installation."
+                } else {
+                    "Continue in your browser."
+                }))
+                .when(!choose_folder && self.approval.is_some(), |s| {
+                    let (code, url) = self.approval.as_ref().unwrap();
+                    let copy = code.clone();
+                    let url = url.clone();
+                    let keyboard_url = url.clone();
+                    s.child(
+                        div()
+                            .p_6()
+                            .bg(rgb(PANEL))
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .rounded_sm()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap_4()
+                            .child(div().text_color(rgb(MUTED)).child("Your approval code"))
+                            .child(
+                                div()
+                                    .text_size(px(52.))
+                                    .font_weight(FontWeight::BOLD)
+                                    .child(code.clone()),
+                            )
+                            .child(button("copy-approval", "Copy code", false, true).on_click(
+                                move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))
+                                },
+                            ))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child(approval_spinner())
+                                    .child(self.status.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .justify_center()
+                            .items_center()
+                            .gap_1()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child("Browser didn't open? Click")
+                            .child(
+                                div()
+                                    .id("reopen-approval")
+                                    .track_focus(&self.nav_focus)
+                                    .on_key_down(move |event: &KeyDownEvent, _, _| {
+                                        if event.keystroke.key == "enter"
+                                            || event.keystroke.key == "space"
+                                        {
+                                            let _ = open::that(&keyboard_url);
+                                        }
+                                    })
+                                    .cursor_pointer()
+                                    .text_color(rgb(TEXT))
+                                    .underline()
+                                    .child("Open browser")
+                                    .on_click(move |_, _, _| {
+                                        let _ = open::that(&url);
+                                    }),
+                            )
+                            .child("to continue."),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .text_center()
+                            .child("Keep this app open while you approve."),
+                    )
+                })
+                .when(self.approval.is_none() || !self.busy, |s| {
+                    s.child(
+                        button(
+                            "setup-next",
+                            if choose_folder {
+                                "Choose game directory"
+                            } else if self.status.starts_with("Sign-in interrupted.") {
+                                "Try again"
+                            } else {
+                                "Sign in"
+                            },
+                            true,
+                            !self.busy && !self.setup_busy,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            if this.game_root.is_none() {
+                                this.choose_game(window, cx);
+                            } else {
+                                this.login(cx);
+                            }
+                        })),
+                    )
+                })
+                .when(
+                    choose_folder || (self.approval.is_none() && !self.status.is_empty()),
+                    |s| {
+                        s.child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(MUTED))
+                                .child(if choose_folder {
+                                    self.setup_status.clone()
+                                } else {
+                                    self.status.clone()
+                                }),
+                        )
+                    },
+                )
+                .into_any_element()
+        } else {
+            match self.tab {
+            Tab::Upload => div().w_full().min_w_0().flex().flex_col().gap_5()
                 .child(div().flex().flex_col().gap_2()
-                    .child(div().text_2xl().child(if self.game_root.is_some() { "Your recordings, found automatically" } else { "Set up recording" }))
-                    .child(div().text_color(rgb(MUTED)).child("Choose your game directory once. We'll download and maintain the recorder addon, and find your recordings.")))
-                .child(div().p_4().bg(rgb(PANEL)).flex().flex_col().gap_3()
-                    .child(div().text_xs().text_color(rgb(MUTED)).truncate().child(self.game_root.as_ref().map(|p| p.display().to_string()).unwrap_or("No game directory chosen".into())))
-                    .child(button("choose-game", if self.game_root.is_some() { "Change game directory" } else { "Choose game directory" }, self.game_root.is_none(), !self.busy && !self.setup_busy)
-                        .on_click(cx.listener(|this, _, window, cx| this.choose_game(window, cx))))
-                    .child(div().text_xs().text_color(rgb(MUTED)).child(self.setup_status.clone())))
+                    .child(div().text_2xl().child("Upload"))
+                    .child(div().text_color(rgb(MUTED)).child("Exit the game before uploading.")))
                 .child(div().flex().flex_col().bg(rgb(PANEL)).border_1().border_color(rgb(BORDER)).rounded_sm().overflow_hidden()
-                    .child(source("combat", "Combat log", self.combat.as_ref(), "Waiting for your first combat log"))
-                    .child(source("recorder", "Recorder export", self.recorder.as_ref(), "Waiting for your first saved recording")))
+                    .child(source("combat", "Combat log", self.combat.as_ref(), "No combat log found"))
+                    .child(source("recorder", "Recorder export", self.recorder.as_ref(), "No recorder export found")))
+                .child(div().p_4().bg(rgb(PANEL)).flex().flex_col().gap_2()
+                    .child("Talent history")
+                    .child(div().text_xs().text_color(rgb(if self.native_history_ready { 0x64d77a } else { MUTED }))
+                        .child(if self.native_history_ready { "Recording. Keep this app open while playing." } else { "Waiting for a readable game save." })))
                 .child(div().id("upload-help").text_xs().text_color(rgb(MUTED)).cursor_pointer()
                     .child(if self.show_help { "Hide upload instructions" } else { "Before you upload >" })
                     .on_click(cx.listener(|this, _, _, cx| { this.show_help = !this.show_help; cx.notify(); })))
-                .when(self.show_help, |s| s.child(div().text_xs().text_color(rgb(MUTED))
-                    .child("Exit the game normally before uploading so your latest run is saved. Recording files are discovered automatically. Keep this app open while playing to record talent history. Older runs are matched only where that history covers their start.")))
+                .when(self.show_help, |s| s.child(div().w_full().min_w_0().whitespace_normal().text_xs().text_color(rgb(MUTED))
+                    .child("Exit the game normally before uploading so your latest run is saved. Recording files are discovered automatically. Keep this app open while playing to record talent history. Older runs are matched only where that history covers their start. Uploaded originals are deleted after 30 days; generated reports remain available.")))
                 .when(self.signed_in && self.pending_count > 0, |s| s.child(
                     div().p_3().bg(rgb(PANEL)).flex().items_center().gap_3()
                         .child(div().flex_1().text_xs().text_color(rgb(MUTED)).child(format!("{} unfinished uploads saved on this computer.", self.pending_count)))
@@ -728,8 +1225,8 @@ impl Render for Uploader {
                             .on_click(cx.listener(|this, _, _, cx| this.upload(true, cx))))))
                 .into_any_element(),
             Tab::Results => div().flex().flex_col().gap_4()
-                .child(div().text_2xl().child(if self.reports.is_empty() { "No reports yet".to_string() } else { format!("{} {} ready", self.reports.len(), if self.reports.len() == 1 { "report" } else { "reports" }) }))
-                .child(div().text_color(rgb(MUTED)).child(if self.reports.is_empty() { "Upload a recording to see its new reports here." } else { "Only reports from your latest upload appear here." }))
+                .child(div().text_2xl().child(if self.reports.is_empty() { "Reports".to_string() } else { format!("{} {}", self.reports.len(), if self.reports.len() == 1 { "report" } else { "reports" }) }))
+                .child(div().text_color(rgb(MUTED)).child(if self.reports.is_empty() { "No uploaded reports." } else { "Reports from the latest upload." }))
                 .when(!self.reports.is_empty(), |s| s.child(
                     div().flex().flex_col().bg(rgb(PANEL)).border_1().border_color(rgb(BORDER)).rounded_sm()
                         .children(self.reports.iter().enumerate().map(|(i, url)| {
@@ -754,10 +1251,6 @@ impl Render for Uploader {
                     .child(button("login", if self.signed_in { "Log out" } else { "Sign in" }, false, !self.busy)
                         .on_click(cx.listener(|this, _, _, cx| { if this.signed_in { this.logout(cx); } else { this.login(cx); } }))))
                 .child(div().p_4().bg(rgb(PANEL)).flex().flex_col().gap_2()
-                    .child("Talent history")
-                    .child(div().text_xs().text_color(rgb(if self.native_history_ready { 0x64d77a } else { MUTED }))
-                        .child(if self.native_history_ready { "Recording. Keep this app open while playing." } else { "Waiting for a readable game save. Choose your game directory and keep this app open before starting runs." })))
-                .child(div().p_4().bg(rgb(PANEL)).flex().flex_col().gap_2()
                     .child("Recorder updates")
                     .child(div().text_xs().text_color(rgb(MUTED)).child(self.setup_status.clone()))
                     .child(button("check-addon", "Check / repair", false, !self.setup_busy && !self.busy && self.game_root.is_some())
@@ -767,7 +1260,7 @@ impl Render for Uploader {
                 .child(div().p_4().bg(rgb(PANEL)).flex().flex_col().gap_2()
                     .child("Game directory")
                     .child(div().text_xs().text_color(rgb(MUTED)).truncate().child(self.game_root.as_ref().map(|p| p.display().to_string()).unwrap_or("Choose a game directory to begin".into())))
-                    .child(button("settings-game", "Choose game directory", false, !self.busy && !self.setup_busy)
+                    .child(button("settings-game", "Change game directory", false, !self.busy && !self.setup_busy)
                         .on_click(cx.listener(|this, _, window, cx| this.choose_game(window, cx)))))
                 .child(div().flex().gap_3()
                     .child(button("manual-combat", "Import combat log", false, !self.busy && !self.setup_busy)
@@ -777,12 +1270,19 @@ impl Render for Uploader {
                 .child(div().p_4().bg(rgb(PANEL)).flex().flex_col().gap_2()
                     .child("Uploader updates")
                     .child(div().text_xs().text_color(rgb(MUTED)).child(self.desktop_status.clone())))
-                .child(div().text_xs().text_color(rgb(MUTED)).child("Closing this window minimizes the app and keeps recording in the background. Use Quit uploader to stop it."))
+                .child(div().p_4().bg(rgb(PANEL)).flex().flex_col().gap_2()
+                    .child("When closing the window")
+                    .child(div().flex().gap_2()
+                        .child(button("close-exit", "Exit app", self.close_behavior.to_tray == Some(false), true).on_click(cx.listener(|this, _, _, cx| { this.close_behavior.save(&this.state, false); cx.notify(); })))
+                        .child(button("close-tray", "Minimize to tray", self.close_behavior.to_tray == Some(true), self.close_behavior.available()).on_click(cx.listener(|this, _, _, cx| { this.close_behavior.save(&this.state, true); cx.notify(); }))))
+                    .child(div().text_xs().text_color(rgb(MUTED)).child("Tray mode keeps recording in the background. Use the tray icon to reopen or quit."))
+                    .when(!self.close_behavior.error.is_empty(), |s| s.child(div().text_color(rgb(LINK)).child(self.close_behavior.error.clone()))))
                 .child(button("quit-uploader", "Quit uploader", false, !self.busy)
                     .on_click(cx.listener(|this, _, _, cx| { if !this.busy { azs_uploader::recovery::clean_exit(&this.state); cx.quit(); } })))
                 .child(div().text_xs().text_color(rgb(MUTED)).child(format!("Server: {}", self.api)))
                 .child(div().text_xs().text_color(rgb(MUTED)).child(self.status.clone()))
                 .into_any_element(),
+        }
         };
         div()
             .size_full()
@@ -804,15 +1304,12 @@ impl Render for Uploader {
                     .border_t_3()
                     .border_color(rgb(ACCENT))
                     .child(
-                        div()
-                            .w_9()
-                            .h_9()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .bg(rgb(ACCENT))
-                            .font_weight(FontWeight::BOLD)
-                            .child("AS"),
+                        img(std::sync::Arc::new(Image::from_bytes(
+                            ImageFormat::Png,
+                            include_bytes!("../assets/app.png").to_vec(),
+                        )))
+                        .w_9()
+                        .h_9(),
                     )
                     .child(
                         div()
@@ -836,7 +1333,9 @@ impl Render for Uploader {
                         div()
                             .text_xs()
                             .text_color(rgb(if self.signed_in { 0x64d77a } else { MUTED }))
-                            .child(if self.signed_in {
+                            .child(if loading {
+                                "Loading..."
+                            } else if self.signed_in {
                                 "Connected"
                             } else {
                                 "Not signed in"
@@ -851,6 +1350,7 @@ impl Render for Uploader {
                     .gap_5()
                     .border_b_1()
                     .border_color(rgb(BORDER))
+                    .when(onboarding, |s| s.hidden())
                     .track_focus(&self.nav_focus)
                     .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                         let next = match (event.keystroke.key.as_str(), this.tab) {
@@ -863,6 +1363,7 @@ impl Render for Uploader {
                             }
                             _ => return,
                         };
+                        this.wheel_animation = None;
                         this.tab = next;
                         if next == Tab::Results {
                             this.unseen_results = false;
@@ -905,6 +1406,7 @@ impl Render for Uploader {
                                     )
                                 })
                                 .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.wheel_animation = None;
                                     this.tab = tab;
                                     if tab == Tab::Results {
                                         this.unseen_results = false;
@@ -917,16 +1419,28 @@ impl Render for Uploader {
             )
             .child(
                 div()
-                    .id(match self.tab {
-                        Tab::Upload => "upload-page",
-                        Tab::Results => "results-page",
-                        Tab::Settings => "settings-page",
-                    })
+                    .relative()
                     .flex_1()
+                    .min_w_0()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .p_6()
-                    .child(content),
+                    .flex()
+                    .child(
+                        div()
+                            .id(match self.tab {
+                                Tab::Upload => "upload-page",
+                                Tab::Results => "results-page",
+                                Tab::Settings => "settings-page",
+                            })
+                            .flex_1()
+                            .min_w_0()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.page_scroll)
+                            .p_6()
+                            .child(content),
+                    )
+                    .child(wheel_capture)
+                    .child(self.page_scrollbar(cx)),
             )
             .child(
                 div()
@@ -938,85 +1452,78 @@ impl Render for Uploader {
                     .flex()
                     .flex_col()
                     .gap_3()
-                    .when(self.tab == Tab::Upload, |s| {
-                        s.child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_3()
-                                .p_3()
-                                .bg(rgb(PANEL))
-                                .border_1()
-                                .border_color(rgb(if !self.game_state.permits_upload() {
-                                    LINK
-                                } else if self.reports.is_empty() {
-                                    BORDER
-                                } else {
-                                    0x64d77a
-                                }))
-                                .rounded_sm()
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_1()
-                                        .child(div().font_weight(FontWeight::SEMIBOLD).child(
-                                            if !self.game_state.permits_upload() {
-                                                self.game_state.title()
-                                            } else if self.busy {
-                                                "Upload in progress"
-                                            } else if !self.reports.is_empty() {
-                                                "Upload complete"
-                                            } else {
-                                                "Upload status"
-                                            },
-                                        ))
-                                        .child(
-                                            div()
-                                                .id("upload-status-detail")
-                                                .max_h(px(240.))
-                                                .overflow_y_scroll()
-                                                .text_sm()
-                                                .text_color(rgb(TEXT))
-                                                .child(if self.game_state.permits_upload() {
-                                                    readable_upload_status(&self.status)
+                    .when(onboarding || self.tab != Tab::Upload, |s| s.hidden())
+                    .when(
+                        self.upload_attempted && (self.busy || self.reports.is_empty()),
+                        |s| {
+                            s.child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .p_3()
+                                    .bg(rgb(PANEL))
+                                    .border_1()
+                                    .border_color(rgb(if !self.game_state.permits_upload() {
+                                        LINK
+                                    } else if self.reports.is_empty() {
+                                        BORDER
+                                    } else {
+                                        0x64d77a
+                                    }))
+                                    .rounded_sm()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_1()
+                                            .child(div().font_weight(FontWeight::SEMIBOLD).child(
+                                                if !self.game_state.permits_upload() {
+                                                    self.game_state.title()
+                                                } else if self.busy {
+                                                    "Upload in progress"
+                                                } else if !self.reports.is_empty() {
+                                                    "Upload complete"
                                                 } else {
-                                                    self.game_state.detail().to_string()
-                                                }),
-                                        ),
-                                )
-                                .child(
-                                    button("copy-upload-status", "Copy details", false, true)
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            let text = if this.game_state.permits_upload() {
-                                                this.status.clone()
-                                            } else {
-                                                this.game_state.detail().to_string()
-                                            };
-                                            cx.write_to_clipboard(ClipboardItem::new_string(text));
-                                        })),
-                                )
-                                .when(!self.reports.is_empty(), |s| {
-                                    s.child(
-                                        button(
-                                            "view-results",
-                                            &format!("View {} reports >", self.reports.len()),
-                                            false,
-                                            true,
-                                        )
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| {
-                                                this.tab = Tab::Results;
-                                                this.unseen_results = false;
-                                                cx.notify();
-                                            }),
-                                        ),
+                                                    "Upload status"
+                                                },
+                                            ))
+                                            .child(
+                                                div()
+                                                    .id("upload-status-detail")
+                                                    .max_h(px(240.))
+                                                    .overflow_y_scroll()
+                                                    .text_sm()
+                                                    .text_color(rgb(TEXT))
+                                                    .child(if self.game_state.permits_upload() {
+                                                        readable_upload_status(&self.status)
+                                                    } else {
+                                                        self.game_state.detail().to_string()
+                                                    }),
+                                            ),
                                     )
-                                }),
-                        )
-                    })
+                                    .when(!self.reports.is_empty(), |s| {
+                                        s.child(
+                                            button(
+                                                "view-results",
+                                                &format!("View {} reports >", self.reports.len()),
+                                                false,
+                                                true,
+                                            )
+                                            .on_click(
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.tab = Tab::Results;
+                                                    this.unseen_results = false;
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                        )
+                                    }),
+                            )
+                        },
+                    )
                     .child(
                         div()
                             .flex()
@@ -1024,11 +1531,139 @@ impl Render for Uploader {
                             .justify_between()
                             .gap_3()
                             .child(
-                                div()
-                                    .flex_1()
-                                    .text_xs()
-                                    .text_color(rgb(MUTED))
-                                    .child("Private reports. Source files stay on this computer."),
+                                div().flex_1().child(
+                                    div()
+                                        .id("visibility-menu")
+                                        .relative()
+                                        .track_focus(&self.visibility_focus)
+                                        .on_mouse_down_out(cx.listener(
+                                            |this, event: &MouseDownEvent, _, cx| {
+                                                if this.visibility_open
+                                                    && !this.visibility_bounds.get().is_some_and(
+                                                        |bounds| bounds.contains(&event.position),
+                                                    )
+                                                {
+                                                    this.visibility_open = false;
+                                                    cx.notify();
+                                                }
+                                            },
+                                        ))
+                                        .on_key_down(cx.listener(
+                                            |this, event: &KeyDownEvent, _, cx| {
+                                                if this.busy {
+                                                    return;
+                                                }
+                                                match event.keystroke.key.as_str() {
+                                                    "escape" => this.visibility_open = false,
+                                                    "enter" | "space" => {
+                                                        this.visibility_open = !this.visibility_open
+                                                    }
+                                                    "up" | "down" if this.visibility_open => {
+                                                        this.public_upload = !this.public_upload
+                                                    }
+                                                    _ => return,
+                                                }
+                                                cx.notify();
+                                            },
+                                        ))
+                                        .child(
+                                            div()
+                                                .id("visibility-trigger")
+                                                .flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .py_2()
+                                                .px_2()
+                                                .rounded_sm()
+                                                .when(!self.busy, |s| {
+                                                    s.cursor_pointer().hover(|s| s.bg(rgb(RAISED)))
+                                                })
+                                                .when(self.busy, |s| s.opacity(0.45))
+                                                .child(visibility_globe())
+                                                .child(if self.public_upload {
+                                                    "Public upload"
+                                                } else {
+                                                    "Private upload"
+                                                })
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(MUTED))
+                                                        .child("\u{25be}"),
+                                                )
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    if !this.busy {
+                                                        this.visibility_open =
+                                                            !this.visibility_open;
+                                                        window.focus(&this.visibility_focus);
+                                                        cx.notify();
+                                                    }
+                                                })),
+                                        )
+                                        .when(self.visibility_open && !self.busy, |s| {
+                                            let popup_bounds = self.visibility_bounds.clone();
+                                            s.child(
+                                                div()
+                                                    .absolute()
+                                                    .bottom(px(42.))
+                                                    .left_0()
+                                                    .w(px(190.))
+                                                    .p_1()
+                                                    .bg(rgb(PANEL))
+                                                    .border_1()
+                                                    .border_color(rgb(BORDER))
+                                                    .rounded_sm()
+                                                    .shadow_md()
+                                                    .child(
+                                                        canvas(
+                                                            |_, _, _| (),
+                                                            move |bounds, _, _, _| {
+                                                                popup_bounds.set(Some(bounds))
+                                                            },
+                                                        )
+                                                        .absolute()
+                                                        .size_full(),
+                                                    )
+                                                    .children(
+                                                        [
+                                                            (false, "Private upload"),
+                                                            (true, "Public upload"),
+                                                        ]
+                                                        .into_iter()
+                                                        .enumerate()
+                                                        .map(|(index, (public, label))| {
+                                                            div()
+                                                                .id(("visibility-option", index))
+                                                                .px_3()
+                                                                .py_2()
+                                                                .rounded_sm()
+                                                                .cursor_pointer()
+                                                                .bg(rgb(
+                                                                    if self.public_upload == public
+                                                                    {
+                                                                        RAISED
+                                                                    } else {
+                                                                        PANEL
+                                                                    },
+                                                                ))
+                                                                .hover(|s| s.bg(rgb(HOVER)))
+                                                                .child(label)
+                                                                .on_click(cx.listener(
+                                                                    move |this, _, _, cx| {
+                                                                        if !this.busy {
+                                                                            this.public_upload =
+                                                                                public;
+                                                                            this.visibility_open =
+                                                                                false;
+                                                                            cx.notify();
+                                                                        }
+                                                                    },
+                                                                ))
+                                                        }),
+                                                    ),
+                                            )
+                                        }),
+                                ),
                             )
                             .child(
                                 button(
@@ -1080,6 +1715,7 @@ impl Render for Uploader {
     }
 }
 fn main() {
+    let _sentry = azs_uploader_core::monitoring::init();
     velopack::VelopackApp::build()
         .set_auto_apply_on_startup(false)
         .run();
@@ -1147,17 +1783,39 @@ fn main() {
             },
             |window, cx| {
                 window.set_window_title("Azeroth Survivors Recorder");
-                window.on_window_should_close(cx, |window, _| {
-                    window.minimize_window();
-                    false
-                });
-                cx.new(|cx| {
+                let uploader = cx.new(|cx| {
                     let mut uploader = Uploader::new(api, state, cx);
                     if let Some(error) = update_error {
                         uploader.desktop_status = error;
                     }
                     uploader
-                })
+                });
+                let close_state = uploader.clone();
+                window.on_window_should_close(cx, move |window, cx| {
+                    close_state.update(cx, |this, cx| {
+                        match this.close_behavior.to_tray {
+                            Some(false) => { azs_uploader::recovery::clean_exit(&this.state); true }
+                            Some(true) if this.close_behavior.available() => { close_behavior::hide(window); false }
+                            _ => {
+                                if !this.close_prompt_open {
+                                    this.close_prompt_open = true;
+                                    let answer = window.prompt(PromptLevel::Info, "What should closing the window do?", Some("Exit stops recording. Tray mode keeps recording in the background. You can change this in Settings."), &["Exit app", "Minimize to tray", "Cancel"], cx);
+                                    cx.spawn(async move |this, cx| {
+                                        if let Ok(choice) = answer.await {
+                                            let _ = this.update(cx, |this, cx| {
+                                                if choice < 2 { let _ = this.sender.send(Message::CloseChoice(choice == 1)); }
+                                                else { this.close_prompt_open = false; }
+                                                cx.notify();
+                                            });
+                                        } else { let _ = this.update(cx, |this, cx| { this.close_prompt_open = false; cx.notify(); }); }
+                                    }).detach();
+                                }
+                                false
+                            }
+                        }
+                    })
+                });
+                uploader
             },
         )
         .expect("Cannot open uploader window");

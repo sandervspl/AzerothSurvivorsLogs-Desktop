@@ -376,9 +376,10 @@ pub fn filter(combat: &[u8], recorder: Option<&[u8]>, year: i32, offset: i32) ->
             }
         }
     }
-    // The API requires a nonempty combat source even for recorder-only evidence.
     if qualifies && out.is_empty() {
-        out.push(b'\n');
+        bail!(
+            "No combat events match the recorder. Select the matching combat log and check the recording year and time zone; no files were uploaded."
+        );
     }
     Ok(Filtered {
         combat: out,
