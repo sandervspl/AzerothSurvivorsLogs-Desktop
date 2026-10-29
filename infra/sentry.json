@@ -1,0 +1,21 @@
+{
+  "organization": "sandervspl",
+  "team": "sandervspl",
+  "projects": {
+    "web": {
+      "slug": "azslogs-web",
+      "id": "4512340469940224",
+      "dsn": "https://7036840b2f17349eb10a94ba45b55e2b@o1167348.ingest.us.sentry.io/4512340469940224"
+    },
+    "api": {
+      "slug": "azslogs-api",
+      "id": "4512340470071296",
+      "dsn": "https://2615f4a6c059f3a635dfd824be049463@o1167348.ingest.us.sentry.io/4512340470071296"
+    },
+    "uploader": {
+      "slug": "azslogs-uploader",
+      "id": "4512340470267904",
+      "dsn": "https://7ab40328b0e9da8a59b29f5b26a6007e@o1167348.ingest.us.sentry.io/4512340470267904"
+    }
+  }
+}
