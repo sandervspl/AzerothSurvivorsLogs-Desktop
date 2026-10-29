@@ -55,5 +55,7 @@ try {
             $signatures += @{ file = [IO.Path]::GetFileName($file); status = 'Valid'; publisher = $signature.SignerCertificate.Subject; thumbprint = $signature.SignerCertificate.Thumbprint }
         }
         $signatures | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $out 'publisher-signature-verification.json') -Encoding UTF8
+        $installer = Get-Item -LiteralPath (Join-Path $out 'AZSLogsUploader-stable-Setup.exe')
+        @{ version = $Version; filename = $installer.Name; size = $installer.Length; sha256 = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant() } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $out 'installer.json') -Encoding UTF8
     }
 } finally { Pop-Location }

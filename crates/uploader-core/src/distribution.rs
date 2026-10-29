@@ -15,6 +15,8 @@ pub const ADDON: &str = "AzerothSurvivorsRecorder";
 const MAX_ARCHIVE: u64 = 8 * 1024 * 1024;
 const MAX_EXPANDED: u64 = 32 * 1024 * 1024;
 const MAX_CATALOG: u64 = 256 * 1024;
+pub const CATALOG_URL: &str =
+    "https://raw.githubusercontent.com/sandervspl/AzerothSurvivorsLogs-Desktop/updates/stable.json";
 
 pub fn retryable(error: &anyhow::Error) -> bool {
     if let Some(network) = error.downcast_ref::<reqwest::Error>() {
@@ -118,7 +120,7 @@ pub struct ReleaseConfig {
 impl ReleaseConfig {
     pub fn configured() -> Result<Self> {
         let mut url = option_env!("AZS_RELEASE_CATALOG_URL")
-            .unwrap_or("https://downloads.azslogs.com/stable.json")
+            .unwrap_or(CATALOG_URL)
             .to_string();
         let mut keys = option_env!("AZS_RELEASE_PUBLIC_KEYS")
             .unwrap_or("")
@@ -152,11 +154,44 @@ impl ReleaseConfig {
         Ok(Self { url, keys: parsed })
     }
     pub fn client(&self) -> Result<reqwest::Client> {
-        Ok(reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?)
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() <= 3
+                    && attempt.previous().first().is_some_and(github_asset)
+                    && github_cdn(attempt.url())
+                {
+                    attempt.follow()
+                } else {
+                    attempt.error("Unapproved release redirect")
+                }
+            }));
+        // An explicit local TLS fixture exercises production host/path rules. These
+        // transport overrides are compiled out of public builds.
+        #[cfg(debug_assertions)]
+        let builder = if let Ok(endpoint) = std::env::var("AZS_RELEASE_TEST_ENDPOINT") {
+            let endpoint: std::net::SocketAddr = endpoint.parse()?;
+            ensure!(
+                endpoint.ip().is_loopback(),
+                "Test transport must be loopback"
+            );
+            let certificate = fs::read(std::env::var("AZS_RELEASE_TEST_CA")?)?;
+            let mut builder = builder
+                .no_proxy()
+                .add_root_certificate(reqwest::Certificate::from_pem(&certificate)?);
+            for host in [
+                "github.com",
+                "raw.githubusercontent.com",
+                "release-assets.githubusercontent.com",
+            ] {
+                builder = builder.resolve(host, endpoint);
+            }
+            builder
+        } else {
+            builder
+        };
+        Ok(builder.build()?)
     }
     fn verify(&self, envelope: &Envelope) -> Result<Catalog> {
         let key = self
@@ -205,14 +240,21 @@ impl ReleaseConfig {
             );
         }
         let source = reqwest::Url::parse(&self.url)?;
-        for url in std::iter::once(catalog.addon.url.as_str())
-            .chain(catalog.desktop.iter().map(|d| d.url.as_str()))
-        {
-            validate_url(url)?;
-            ensure!(
-                reqwest::Url::parse(url)?.origin() == source.origin(),
-                "Release assets must use the configured download origin"
-            );
+        validate_asset(
+            &source,
+            &catalog.addon.url,
+            "Addon",
+            &catalog.addon.version,
+            &format!("{ADDON}-{}.zip", catalog.addon.version),
+        )?;
+        if let Some(desktop) = &catalog.desktop {
+            validate_asset(
+                &source,
+                &desktop.url,
+                "Desktop",
+                &desktop.version,
+                &desktop.filename,
+            )?;
         }
         atomic_json(
             &policy_path,
@@ -318,6 +360,69 @@ fn validate_url(url: &str) -> Result<()> {
             && parsed.query().is_none(),
         "Invalid release URL"
     );
+    Ok(())
+}
+fn github_cdn(url: &reqwest::Url) -> bool {
+    url.scheme() == "https"
+        && url.host_str() == Some("release-assets.githubusercontent.com")
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.fragment().is_none()
+}
+fn github_asset(url: &reqwest::Url) -> bool {
+    if url.scheme() != "https"
+        || url.host_str() != Some("github.com")
+        || url.port().is_some()
+        || validate_url(url.as_str()).is_err()
+    {
+        return false;
+    }
+    let parts: Vec<_> = url.path().split('/').skip(1).collect();
+    parts.len() == 6
+        && parts[0] == "sandervspl"
+        && matches!(
+            (parts[1], parts[4].split_once("-v").map(|p| p.0)),
+            ("AzerothSurvivorsLogs-Addon", Some("addon"))
+                | ("AzerothSurvivorsLogs-Desktop", Some("desktop"))
+        )
+        && parts[2] == "releases"
+        && parts[3] == "download"
+        && parts[4]
+            .split_once("-v")
+            .is_some_and(|(_, v)| semver::Version::parse(v).is_ok())
+        && !parts[5].is_empty()
+        && parts[5]
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+}
+fn validate_asset(
+    source: &reqwest::Url,
+    url: &str,
+    component: &str,
+    version: &str,
+    filename: &str,
+) -> Result<()> {
+    validate_url(url)?;
+    let asset = reqwest::Url::parse(url)?;
+    if github_asset(&asset) {
+        ensure!(
+            asset.path()
+                == format!(
+                    "/sandervspl/AzerothSurvivorsLogs-{component}/releases/download/{}-v{version}/{filename}",
+                    component.to_ascii_lowercase()
+                ),
+            "GitHub release repository, version or filename mismatch"
+        );
+    } else {
+        ensure!(
+            !matches!(
+                source.host_str(),
+                Some("github.com" | "raw.githubusercontent.com")
+            ) && source.origin() == asset.origin(),
+            "Unapproved release asset origin or repository"
+        );
+    }
     Ok(())
 }
 fn validate_addon(addon: &AddonRelease) -> Result<()> {

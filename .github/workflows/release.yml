@@ -8,7 +8,7 @@ on:
       signed_installer:
         description: Build a signed managed installer (requires publisher configuration)
         type: boolean
-        default: false
+        default: true
 permissions:
   contents: write
   id-token: write
@@ -41,7 +41,7 @@ jobs:
           [IO.File]::WriteAllText($metadata, $env:SIGNING_METADATA)
           "AZS_WINDOWS_SIGNING_METADATA=$metadata" >> $env:GITHUB_ENV
           "AZS_RELEASE_PUBLIC_KEYS=$env:PUBLIC_KEYS" >> $env:GITHUB_ENV
-          'AZS_RELEASE_CATALOG_URL=https://downloads.azslogs.com/stable.json' >> $env:GITHUB_ENV
+          'AZS_RELEASE_CATALOG_URL=https://raw.githubusercontent.com/sandervspl/AzerothSurvivorsLogs-Desktop/updates/stable.json' >> $env:GITHUB_ENV
       - uses: actions/setup-dotnet@v4
         if: inputs.signed_installer
         with:
@@ -70,7 +70,7 @@ jobs:
           TAG: ${{ inputs.tag }}
         run: |
           $source = Get-Content SOURCE_COMMIT
-          gh release create $env:TAG artifacts/desktop-release/*Setup.exe artifacts/desktop-release/*-full.nupkg artifacts/desktop-release/releases.stable.json artifacts/desktop-release/publisher-signature-verification.json --target $env:GITHUB_SHA --draft --title $env:TAG --notes "Publisher-signed Windows installer. Source monorepo commit: $source. Publishing this release does not update the authenticated update catalog."
+          gh release create $env:TAG artifacts/desktop-release/*Setup.exe artifacts/desktop-release/*-full.nupkg artifacts/desktop-release/releases.stable.json artifacts/desktop-release/installer.json artifacts/desktop-release/publisher-signature-verification.json --target $env:GITHUB_SHA --draft --title $env:TAG --notes "Publisher-signed Windows installer. Source monorepo commit: $source. After explicit release publication, prepare the authenticated catalog from the monorepo."
       - name: Create draft for review
         if: ${{ !inputs.signed_installer }}
         shell: pwsh

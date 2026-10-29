@@ -530,6 +530,34 @@ impl Uploader {
         });
     }
 }
+fn readable_upload_status(raw: &str) -> String {
+    if let Some(start) = raw.find('[') {
+        let mut stream =
+            serde_json::Deserializer::from_str(&raw[start..]).into_iter::<serde_json::Value>();
+        if let Some(Ok(serde_json::Value::Array(issues))) = stream.next() {
+            let messages: Vec<&str> = issues
+                .iter()
+                .filter_map(|issue| issue["message"].as_str())
+                .collect();
+            if !messages.is_empty() {
+                let mut text = format!("{}\n\n{}", raw[..start].trim(), messages.join("\n\n"));
+                if messages
+                    .iter()
+                    .any(|message| message.contains("unsupported executable"))
+                {
+                    text.push_str("\n\nThe server does not recognize this game build. Its native talent catalog needs to be refreshed before this recording can be processed.");
+                }
+                let tail = raw[start + stream.byte_offset()..].trim();
+                if !tail.is_empty() {
+                    text.push_str("\n\n");
+                    text.push_str(tail);
+                }
+                return text;
+            }
+        }
+    }
+    raw.to_string()
+}
 // Keep these neutrals and primary accent in sync with apps/web/src/styles.css.
 mod palette {
     pub const PAGE: u32 = 0x141414;
@@ -948,16 +976,27 @@ impl Render for Uploader {
                                         .child(
                                             div()
                                                 .id("upload-status-detail")
-                                                .max_h(px(64.))
+                                                .max_h(px(240.))
                                                 .overflow_y_scroll()
-                                                .text_xs()
-                                                .text_color(rgb(MUTED))
+                                                .text_sm()
+                                                .text_color(rgb(TEXT))
                                                 .child(if self.game_state.permits_upload() {
-                                                    self.status.clone()
+                                                    readable_upload_status(&self.status)
                                                 } else {
                                                     self.game_state.detail().to_string()
                                                 }),
                                         ),
+                                )
+                                .child(
+                                    button("copy-upload-status", "Copy details", false, true)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            let text = if this.game_state.permits_upload() {
+                                                this.status.clone()
+                                            } else {
+                                                this.game_state.detail().to_string()
+                                            };
+                                            cx.write_to_clipboard(ClipboardItem::new_string(text));
+                                        })),
                                 )
                                 .when(!self.reports.is_empty(), |s| {
                                     s.child(

@@ -14,6 +14,15 @@ async fn main() -> Result<()> {
     let option = |name: &str| options.get(name).map(String::as_str);
     let state = Path::new(option("--state").unwrap_or(".state/uploader"));
     match command.as_str() {
+        "inspect-game" => {
+            println!(
+                "{}",
+                azs_uploader_core::client_build::inspect(Path::new(
+                    option("--game-exe").context("Pass --game-exe")?
+                ))?
+            );
+            return Ok(());
+        }
         "release-config" => {
             let config = azs_uploader_core::distribution::ReleaseConfig::configured()?;
             println!(

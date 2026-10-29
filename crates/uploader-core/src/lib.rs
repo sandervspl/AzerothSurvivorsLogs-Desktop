@@ -1,3 +1,4 @@
+pub mod client_build;
 pub mod distribution;
 pub mod game_process;
 pub mod native_history;

@@ -69,10 +69,14 @@ fn class(text: &str) -> Result<u8> {
 pub struct Reader {
     key: Vec<u8>,
     pub executable_sha256: String,
+    client_build: Option<Value>,
+    executable_path: PathBuf,
+    executable_modified: u64,
+    executable_size: u64,
 }
 impl Reader {
     pub fn open(executable: &Path) -> Result<Self> {
-        let (exe, _) = read_stable(executable, 512 * 1024 * 1024)?;
+        let (exe, executable_modified) = read_stable(executable, 512 * 1024 * 1024)?;
         let prefix: Vec<u8> = b"azeroth-survivors/sa".iter().map(|b| b ^ 0x36).collect();
         let at = memchr::memmem::find(&exe, &prefix)
             .context("Save reader does not support this executable")?;
@@ -88,9 +92,20 @@ impl Reader {
         Ok(Self {
             key,
             executable_sha256: crate::sha256(&exe),
+            client_build: crate::client_build::extract(&exe),
+            executable_path: executable.into(),
+            executable_modified,
+            executable_size: exe.len() as u64,
         })
     }
     pub fn read(&self, save: &Path) -> Result<Value> {
+        let metadata = fs::metadata(&self.executable_path)?;
+        if metadata.len() != self.executable_size
+            || metadata.modified()?.duration_since(UNIX_EPOCH)?.as_millis() as u64
+                != self.executable_modified
+        {
+            bail!("Game executable changed; restart monitoring to capture the new build");
+        }
         let (sealed, modified) = read_stable(save, 1024 * 1024)?;
         let key = &self.key;
         let body = std::str::from_utf8(&sealed)?
@@ -168,7 +183,7 @@ impl Reader {
             bail!("Native spec has no corresponding talent row");
         }
         Ok(
-            json!({"schemaVersion":1,"kind":"azs-native-save","observedAt":chrono::Utc::now().timestamp_millis(),"sourceModifiedAt":modified,"sourceSha256":crate::sha256(&sealed),"executableSha256":self.executable_sha256,"classes":allocations}),
+            json!({"schemaVersion":1,"kind":"azs-native-save","observedAt":chrono::Utc::now().timestamp_millis(),"sourceModifiedAt":modified,"sourceSha256":crate::sha256(&sealed),"executableSha256":self.executable_sha256,"clientBuild":self.client_build,"classes":allocations}),
         )
     }
 }
