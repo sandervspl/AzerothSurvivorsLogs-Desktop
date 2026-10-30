@@ -2,6 +2,8 @@
 mod close_behavior;
 mod desktop_updates;
 mod game_process;
+#[cfg(windows)]
+mod install_completion;
 mod setup;
 
 use azs_uploader_core::{Engine, StageOptions, validate_api};
@@ -1727,9 +1729,16 @@ impl Render for Uploader {
 }
 fn main() {
     let _sentry = azs_uploader_core::monitoring::init();
+    let first_run = std::cell::Cell::new(false);
     velopack::VelopackApp::build()
         .set_auto_apply_on_startup(false)
+        .on_first_run(|_| first_run.set(true))
         .run();
+    #[cfg(windows)]
+    if first_run.get() {
+        install_completion::run();
+        return;
+    }
     let args: Vec<String> = std::env::args().collect();
     let value = |name: &str| {
         args.iter()
