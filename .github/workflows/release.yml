@@ -67,9 +67,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
         run: |
-          $source = Get-Content SOURCE_COMMIT
+          $notesPath = "release-notes/desktop/$env:TAG.md"
+          if (-not (Test-Path $notesPath) -or -not (Get-Content $notesPath -Raw).Trim()) { throw 'Write player-facing release notes for this version first.' }
           $installer = Get-Content artifacts/desktop-release/installer.json | ConvertFrom-Json
-          $notes = "Windows managed installer ($($installer.codeSigning)). Source monorepo commit: $source. Unsigned installers may show Windows publisher/reputation warnings. Updates still require the authenticated catalog. Publishing this release does not promote the catalog."
+          $notes = Get-Content $notesPath -Raw
+          if ($installer.codeSigning -eq 'unsigned' -and $notes -notmatch 'unknown-publisher') {
+            $notes += "`n`nWindows or your browser may show an unknown-publisher warning because this installer is unsigned."
+          }
           New-Item -ItemType Directory -Path .state -Force | Out-Null
           $notes | Set-Content .state/release-notes.md
           gh release create $env:TAG artifacts/desktop-release/*Setup.exe artifacts/desktop-release/*-full.nupkg artifacts/desktop-release/releases.stable.json artifacts/desktop-release/installer.json artifacts/desktop-release/publisher-signature-verification.json artifacts/desktop-release/embedded-update-trust.json --target $env:GITHUB_SHA --draft --title $env:TAG --notes-file .state/release-notes.md

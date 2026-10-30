@@ -1292,8 +1292,6 @@ impl Render for Uploader {
                     .when(!self.close_behavior.error.is_empty(), |s| s.child(div().text_color(rgb(LINK)).child(self.close_behavior.error.clone()))))
                 .child(button("quit-uploader", "Quit uploader", false, !self.busy)
                     .on_click(cx.listener(|this, _, _, cx| { if !this.busy { azs_uploader::recovery::clean_exit(&this.state); cx.quit(); } })))
-                .child(div().text_xs().text_color(rgb(MUTED)).child(format!("Server: {}", self.api)))
-                .child(div().text_xs().text_color(rgb(MUTED)).child(self.status.clone()))
                 .into_any_element(),
         }
         };
