@@ -14,6 +14,11 @@ use velopack::{
     sources::UpdateSource,
 };
 const MAX_PACKAGE: u64 = 512 * 1024 * 1024;
+pub fn ready() -> bool {
+    UpdateManager::new(velopack::sources::NoneSource {}, None, None)
+        .ok()
+        .is_some_and(|manager| manager.get_update_pending_restart().is_some())
+}
 use azs_uploader::recovery::PACKAGE_ID;
 
 struct VerifiedSource {
@@ -165,7 +170,7 @@ pub fn prepare(state: &Path) -> Result<String> {
     };
     if azs_uploader::recovery::blocked(state, &release.version) {
         return Ok(format!(
-            "Uploader {} failed its startup check. The previous version was restored; waiting for a corrected release.",
+            "Uploader {} failed its update check and is blocked; waiting for a corrected release.",
             release.version
         ));
     }

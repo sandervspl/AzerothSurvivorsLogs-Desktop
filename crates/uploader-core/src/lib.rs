@@ -404,7 +404,11 @@ impl Engine {
             "UPDATE jobs SET status = 'uploading', error = NULL WHERE id = ?",
             [&job.id],
         )?;
-        let result = self.upload_inner(job, token, progress).await;
+        let result = self.upload_inner(job, token, progress).await.map_err(|error| {
+            if error.chain().any(|cause| cause.downcast_ref::<reqwest::Error>().is_some()) {
+                error.context("Connection to the upload server was interrupted. Your upload is saved; use Resume uploads to check it again.")
+            } else { error }
+        });
         if let Err(error) = &result {
             monitoring::capture(error);
             self.db()?.execute(
@@ -508,16 +512,45 @@ impl Engine {
                 .await?,
         )
         .await?;
-        progress("Processing report".into());
+        let mut connection_failures = 0;
         for _ in 0..180 {
-            let mut status: Value = checked(
-                self.client
-                    .get(format!("{}/api/v1/uploads/{id}", job.api))
-                    .bearer_auth(token)
-                    .send()
-                    .await?,
-            )
-            .await?;
+            let response = match self
+                .client
+                .get(format!("{}/api/v1/uploads/{id}", job.api))
+                .bearer_auth(token)
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    connection_failures = 0;
+                    response
+                }
+                Err(error) if connection_failures < 3 => {
+                    connection_failures += 1;
+                    progress("Connection interrupted; checking your saved upload again.".into());
+                    tokio::time::sleep(Duration::from_secs(connection_failures)).await;
+                    drop(error);
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let mut status: Value = checked(response).await?;
+            if status["status"] == "queued" && status["processingPaused"] == true {
+                self.db()?.execute(
+                    "UPDATE jobs SET status = 'pending', error = NULL WHERE id = ?",
+                    [&job.id],
+                )?;
+                progress(
+                    "Uploaded and queued; run processing is temporarily paused. No action needed."
+                        .into(),
+                );
+                return Ok(status);
+            }
+            progress(if status["status"] == "queued" {
+                "Uploaded and queued; waiting for processing".into()
+            } else {
+                "Processing report".into()
+            });
             if status["status"] == "ready" {
                 self.db()?.execute(
                     "UPDATE jobs SET status = 'ready', error = NULL, finished_at = ? WHERE id = ?",

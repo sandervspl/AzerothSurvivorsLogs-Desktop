@@ -134,6 +134,9 @@ pub fn arm(state: &Path, new_version: &str, restart_args: &[String]) -> Result<P
     let plan = state.join("desktop-attempt.json");
     atomic_json(&plan, &attempt)?;
     let mut command = Command::new(&guard);
+    // A Windows process holds its working directory open. The guard outlives
+    // the app, so inheriting current/ would prevent Velopack replacing it.
+    command.current_dir(&recovery);
     command.arg(&plan);
     hidden(&mut command);
     command
@@ -373,6 +376,20 @@ pub fn run_guard(plan_path: &Path) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+    if latest.is_none() {
+        let locator = auto_locate_app_manifest(LocationContext::FromSpecifiedRootDir(
+            plan.root.clone(),
+            None,
+        ))?;
+        if locator.get_manifest_version_full_string() == plan.old_version {
+            atomic_json(
+                &plan.state.join("desktop-recovery-status.json"),
+                &serde_json::json!({"status":"deferred","version":plan.old_version,"detail":"The update could not replace the installed files. Close the uploader and retry."}),
+            )?;
+            fs::remove_file(plan_path)?;
+            return Ok(());
+        }
+    }
     atomic_json(
         &plan.state.join("blocked-desktop.json"),
         &serde_json::json!({"version":plan.new_version,"reason":"Startup health check failed"}),
@@ -397,6 +414,7 @@ pub fn run_guard(plan_path: &Path) -> Result<()> {
         &serde_json::json!({"status":"restoring","version":plan.old_version,"failedVersion":plan.new_version}),
     )?;
     let mut command = Command::new(plan.root.join("Update.exe"));
+    command.current_dir(&plan.root);
     command
         .args(["apply", "--silent", "--package"])
         .arg(&plan.previous)

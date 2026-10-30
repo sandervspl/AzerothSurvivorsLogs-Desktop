@@ -5,6 +5,7 @@ mod game_process;
 #[cfg(windows)]
 mod install_completion;
 mod setup;
+mod startup;
 
 use azs_uploader_core::{Engine, StageOptions, validate_api};
 use chrono::Datelike;
@@ -31,6 +32,7 @@ enum Message {
     Account(String),
     Pending { generation: u64, count: usize },
     Finished(Vec<String>),
+    ProcessingPaused,
 }
 struct Uploader {
     close_behavior: close_behavior::CloseBehavior,
@@ -46,6 +48,13 @@ struct Uploader {
     visibility_open: bool,
     visibility_focus: FocusHandle,
     public_upload: bool,
+    start_on_windows: bool,
+    startup_error: String,
+    automatic_upload: bool,
+    automatic_pending: bool,
+    automatic_open: bool,
+    automatic_focus: FocusHandle,
+    automatic_bounds: std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
     approval: Option<(String, String)>,
     api: String,
     state: PathBuf,
@@ -61,6 +70,7 @@ struct Uploader {
     unseen_results: bool,
     nav_focus: FocusHandle,
     pending_count: usize,
+    paused_check_at: Option<std::time::Instant>,
     owner: Option<String>,
     account_generation: u64,
     sender: mpsc::Sender<Message>,
@@ -172,7 +182,12 @@ impl Uploader {
                                         });
                                     }
                                 }
-                                Message::GameState(state) => this.game_state = state,
+                                Message::GameState(state) => {
+                                    if state == game_process::State::Running {
+                                        this.automatic_pending = this.automatic_upload;
+                                    }
+                                    this.game_state = state;
+                                },
                                 Message::Status(text) => this.status = text,
                                 Message::Approval { code, url } => {
                                     this.approval = Some((code, url))
@@ -217,6 +232,9 @@ impl Uploader {
                                         this.pending_count = count;
                                     }
                                 }
+                                Message::ProcessingPaused => {
+                                    this.paused_check_at = Some(std::time::Instant::now() + Duration::from_secs(15));
+                                }
                                 Message::Finished(reports) => {
                                     this.refresh_pending();
                                     this.reports = reports;
@@ -226,6 +244,24 @@ impl Uploader {
                                 }
                             }
                             cx.notify();
+                        }
+                        if this.paused_check_at.is_some_and(|at| std::time::Instant::now() >= at)
+                            && !this.busy && !this.setup_busy && this.signed_in
+                            && this.game_state.permits_upload() && this.pending_count > 0
+                        {
+                            this.paused_check_at = None;
+                            let tab = this.tab;
+                            this.upload(true, cx);
+                            this.tab = tab;
+                        }
+                        if this.automatic_upload && this.automatic_pending
+                            && this.game_state.permits_upload() && this.signed_in
+                            && this.setup_loaded && !this.busy && !this.setup_busy
+                            && this.combat.as_ref().is_some_and(|p| p.is_file())
+                            && this.recorder.as_ref().is_some_and(|p| p.is_file())
+                        {
+                            this.upload(false, cx);
+                            if this.busy { this.automatic_pending = false; }
                         }
                         let ready = this
                             .native_monitor
@@ -261,6 +297,14 @@ impl Uploader {
             visibility_bounds: Default::default(),
             visibility_open: false,
             visibility_focus: cx.focus_handle(),
+            automatic_upload: std::fs::read_to_string(state.join("automatic-upload"))
+                .is_ok_and(|value| value == "true"),
+            automatic_pending: false,
+            automatic_open: false,
+            automatic_focus: cx.focus_handle(),
+            automatic_bounds: Default::default(),
+            start_on_windows: startup::enabled(),
+            startup_error: String::new(),
             public_upload: true,
             approval: None,
             api,
@@ -277,6 +321,7 @@ impl Uploader {
             unseen_results: false,
             nav_focus: cx.focus_handle(),
             pending_count: 0,
+            paused_check_at: None,
             owner: None,
             account_generation: 0,
             sender,
@@ -653,6 +698,19 @@ impl Uploader {
             }
         });
     }
+    fn set_automatic_upload(&mut self, enabled: bool) {
+        match std::fs::create_dir_all(&self.state)
+            .and_then(|()| std::fs::write(self.state.join("automatic-upload"), enabled.to_string()))
+        {
+            Ok(()) => {
+                self.automatic_upload = enabled;
+                self.automatic_pending = enabled && self.game_state == game_process::State::Running;
+            }
+            Err(error) => {
+                self.status = format!("Could not save automatic upload preference: {error}")
+            }
+        }
+    }
     fn upload(&mut self, resume: bool, cx: &mut Context<Self>) {
         self.game_state = game_process::check();
         if !self.game_state.permits_upload() {
@@ -671,6 +729,7 @@ impl Uploader {
         {
             return;
         }
+        self.paused_check_at = None;
         self.busy = true;
         self.reports.clear();
         self.tab = Tab::Upload;
@@ -689,7 +748,7 @@ impl Uploader {
         let recorder = self.recorder.clone();
         let tx = self.sender.clone();
         std::thread::spawn(move || {
-            let result = (|| -> anyhow::Result<(Vec<String>, Vec<String>)> {
+            let result = (|| -> anyhow::Result<(Vec<String>, Vec<String>, usize)> {
                 let runtime = tokio::runtime::Runtime::new()?;
                 runtime.block_on(async {
                     game_process::ensure_closed()?;
@@ -725,6 +784,7 @@ impl Uploader {
                     };
                     let mut reports = vec![];
                     let mut failures = vec![];
+                    let mut paused = 0;
                     for job in jobs {
                         if let Err(error) = game_process::ensure_closed() {
                             failures.push(error.to_string());
@@ -742,6 +802,9 @@ impl Uploader {
                                 continue;
                             }
                         };
+                        if result["processingPaused"] == true {
+                            paused += 1;
+                        }
                         if let Some(runs) = result["newRuns"].as_array() {
                             for run in runs {
                                 if let Some(id) = run.as_str() {
@@ -750,13 +813,18 @@ impl Uploader {
                             }
                         }
                     }
-                    Ok((reports, failures))
+                    Ok((reports, failures, paused))
                 })
             })();
             match result {
-                Ok((reports, failures)) => {
+                Ok((reports, failures, paused)) => {
+                    if paused > 0 {
+                        tx.send(Message::ProcessingPaused).ok();
+                    }
                     tx.send(Message::Status(if !failures.is_empty() {
-                        format!("{} reports ready; {} uploads failed. {} Invalid recordings are kept locally but cannot be resumed; select corrected files and use Upload recording. Other unfinished uploads remain resumable.", reports.len(), failures.len(), failures.join("; "))
+                        format!("{} reports ready; {} uploads need attention. {}", reports.len(), failures.len(), failures.join("; "))
+                    } else if paused > 0 {
+                        format!("{paused} uploads queued; run processing is temporarily paused. No action needed; checking automatically.")
                     } else if reports.is_empty() {
                         "No new logs. This recording is already uploaded, or there is nothing pending.".into()
                     } else {
@@ -841,6 +909,35 @@ fn visibility_globe() -> impl IntoElement {
             }
             builder.move_to(point(center.x - px(6.), center.y));
             builder.line_to(point(center.x + px(6.), center.y));
+            if let Ok(path) = builder.build() {
+                window.paint_path(path, rgb(palette::TEXT));
+            }
+        },
+    )
+    .w(px(16.))
+    .h(px(16.))
+    .flex_shrink_0()
+}
+fn automatic_upload_icon() -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        |bounds, _, window, _| {
+            let center = bounds.center();
+            let mut builder = PathBuilder::stroke(px(1.3));
+            for points in [
+                vec![(0., 3.), (0., -6.)],
+                vec![(-4., -2.), (0., -6.), (4., -2.)],
+                vec![(-6., 2.), (-6., 6.), (6., 6.), (6., 2.)],
+            ] {
+                for (index, (x, y)) in points.into_iter().enumerate() {
+                    let p = point(center.x + px(x), center.y + px(y));
+                    if index == 0 {
+                        builder.move_to(p);
+                    } else {
+                        builder.line_to(p);
+                    }
+                }
+            }
             if let Ok(path) = builder.build() {
                 window.paint_path(path, rgb(palette::TEXT));
             }
@@ -948,7 +1045,12 @@ impl Render for Uploader {
                     s.cursor_pointer()
                         .hover(move |s| s.bg(rgb(if primary { ACCENT_HOVER } else { HOVER })))
                 })
-                .when(!enabled, |s| s.opacity(0.45))
+                .text_color(rgb(if primary { 0xffffff } else { TEXT }))
+                .when(!enabled, |s| {
+                    s.bg(rgb(RAISED))
+                        .border_color(rgb(BORDER))
+                        .text_color(rgb(MUTED))
+                })
                 .child(label.to_string())
         };
         let source = |id: &'static str, title: &str, path: Option<&PathBuf>, fallback: &str| {
@@ -1292,6 +1394,17 @@ impl Render for Uploader {
                         .child(button("close-tray", "Minimize to tray", self.close_behavior.to_tray == Some(true), self.close_behavior.available()).on_click(cx.listener(|this, _, _, cx| { this.close_behavior.save(&this.state, true); cx.notify(); }))))
                     .child(div().text_xs().text_color(rgb(MUTED)).child("Tray mode keeps recording in the background. Use the tray icon to reopen or quit."))
                     .when(!self.close_behavior.error.is_empty(), |s| s.child(div().text_color(rgb(LINK)).child(self.close_behavior.error.clone()))))
+                .child(div().p_4().bg(rgb(PANEL)).flex().flex_col().gap_2()
+                    .child("Start on Windows startup")
+                    .child(button("windows-startup", if self.start_on_windows { "On" } else { "Off" }, self.start_on_windows, cfg!(windows))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            match startup::set(!this.start_on_windows) {
+                                Ok(()) => { this.start_on_windows = startup::enabled(); this.startup_error.clear(); }
+                                Err(error) => this.startup_error = format!("Could not change Windows startup: {error}"),
+                            }
+                            cx.notify();
+                        })))
+                    .when(!self.startup_error.is_empty(), |s| s.child(div().text_color(rgb(LINK)).child(self.startup_error.clone()))))
                 .child(button("quit-uploader", "Quit uploader", false, !self.busy)
                     .on_click(cx.listener(|this, _, _, cx| { if !this.busy { azs_uploader::recovery::clean_exit(&this.state); cx.quit(); } })))
                 .into_any_element(),
@@ -1305,6 +1418,20 @@ impl Render for Uploader {
             .text_color(rgb(TEXT))
             .font_family("Segoe UI")
             .text_sm()
+            .when(desktop_updates::ready(), |s| s.child(
+                div().flex_shrink_0().px_6().py_3().bg(rgb(PANEL)).flex().items_center().gap_3()
+                    .child(div().flex_1().child("An uploader update is ready. Close the game to install it."))
+                    .child(button("install-update", "Install and restart", true, !self.busy && !self.setup_busy && self.game_state.permits_upload())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.busy || this.setup_busy || !this.game_state.permits_upload() { return; }
+                            let args: Vec<String> = std::env::args().skip(1).collect();
+                            this.desktop_status = match desktop_updates::apply_on_safe_launch(&this.state, &args) {
+                                Ok(()) => "Update is not available for installation. Check automatic update settings.".into(),
+                                Err(error) => format!("Update installation failed: {error:#}"),
+                            };
+                            this.tab = Tab::Settings;
+                            cx.notify();
+                        })))))
             .child(
                 div()
                     .flex_shrink_0()
@@ -1667,6 +1794,140 @@ impl Render for Uploader {
                                                                             this.public_upload =
                                                                                 public;
                                                                             this.visibility_open =
+                                                                                false;
+                                                                            cx.notify();
+                                                                        }
+                                                                    },
+                                                                ))
+                                                        }),
+                                                    ),
+                                            )
+                                        }),
+                                ),
+                            )
+                            .child(
+                                div().flex_1().child(
+                                    div()
+                                        .id("automatic-menu")
+                                        .relative()
+                                        .track_focus(&self.automatic_focus)
+                                        .on_mouse_down_out(cx.listener(
+                                            |this, event: &MouseDownEvent, _, cx| {
+                                                if this.automatic_open
+                                                    && !this.automatic_bounds.get().is_some_and(
+                                                        |bounds| bounds.contains(&event.position),
+                                                    )
+                                                {
+                                                    this.automatic_open = false;
+                                                    cx.notify();
+                                                }
+                                            },
+                                        ))
+                                        .on_key_down(cx.listener(
+                                            |this, event: &KeyDownEvent, _, cx| {
+                                                if this.busy {
+                                                    return;
+                                                }
+                                                match event.keystroke.key.as_str() {
+                                                    "escape" => this.automatic_open = false,
+                                                    "enter" | "space" => {
+                                                        this.automatic_open = !this.automatic_open
+                                                    }
+                                                    "up" | "down" if this.automatic_open => {
+                                                        this.set_automatic_upload(!this.automatic_upload)
+                                                    }
+                                                    _ => return,
+                                                }
+                                                cx.notify();
+                                            },
+                                        ))
+                                        .child(
+                                            div()
+                                                .id("automatic-trigger")
+                                                .flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .py_2()
+                                                .px_2()
+                                                .rounded_sm()
+                                                .when(!self.busy, |s| {
+                                                    s.cursor_pointer().hover(|s| s.bg(rgb(RAISED)))
+                                                })
+                                                .when(self.busy, |s| s.opacity(0.45))
+                                                .child(automatic_upload_icon())
+                                                .child(if self.automatic_upload {
+                                                    "Automatic upload on"
+                                                } else {
+                                                    "Automatic upload off"
+                                                })
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(MUTED))
+                                                        .child("\u{25be}"),
+                                                )
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    if !this.busy {
+                                                        this.automatic_open =
+                                                            !this.automatic_open;
+                                                        window.focus(&this.automatic_focus);
+                                                        cx.notify();
+                                                    }
+                                                })),
+                                        )
+                                        .when(self.automatic_open && !self.busy, |s| {
+                                            let popup_bounds = self.automatic_bounds.clone();
+                                            s.child(
+                                                div()
+                                                    .absolute()
+                                                    .bottom(px(42.))
+                                                    .left_0()
+                                                    .w(px(230.))
+                                                    .p_1()
+                                                    .bg(rgb(PANEL))
+                                                    .border_1()
+                                                    .border_color(rgb(BORDER))
+                                                    .rounded_sm()
+                                                    .shadow_md()
+                                                    .child(
+                                                        canvas(
+                                                            |_, _, _| (),
+                                                            move |bounds, _, _, _| {
+                                                                popup_bounds.set(Some(bounds))
+                                                            },
+                                                        )
+                                                        .absolute()
+                                                        .size_full(),
+                                                    )
+                                                    .children(
+                                                        [
+                                                            (false, "Automatic upload off"),
+                                                            (true, "Automatic upload on"),
+                                                        ]
+                                                        .into_iter()
+                                                        .enumerate()
+                                                        .map(|(index, (public, label))| {
+                                                            div()
+                                                                .id(("automatic-option", index))
+                                                                .px_3()
+                                                                .py_2()
+                                                                .rounded_sm()
+                                                                .cursor_pointer()
+                                                                .bg(rgb(
+                                                                    if self.automatic_upload == public
+                                                                    {
+                                                                        RAISED
+                                                                    } else {
+                                                                        PANEL
+                                                                    },
+                                                                ))
+                                                                .hover(|s| s.bg(rgb(HOVER)))
+                                                                .child(label)
+                                                                .on_click(cx.listener(
+                                                                    move |this, _, _, cx| {
+                                                                        if !this.busy {
+                                                                            this.set_automatic_upload(public);
+                                                                            this.automatic_open =
                                                                                 false;
                                                                             cx.notify();
                                                                         }
