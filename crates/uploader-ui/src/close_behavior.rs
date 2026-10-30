@@ -74,7 +74,11 @@ fn create_tray() -> Option<tray_icon::TrayIcon> {
         None,
     ))
     .ok()?;
-    let pixels = include_bytes!("../assets/tray.rgba").to_vec();
+    let pixels = if cfg!(debug_assertions) {
+        include_bytes!("../assets/tray-dev.rgba").to_vec()
+    } else {
+        include_bytes!("../assets/tray.rgba").to_vec()
+    };
     TrayIconBuilder::new()
         .with_tooltip("Azeroth Survivors Recorder")
         .with_menu(Box::new(menu))

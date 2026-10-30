@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     thread,
     time::Duration,
@@ -31,6 +31,7 @@ fn source_id(save: &Path, reader: &Reader) -> Result<String> {
 }
 pub struct Monitor {
     ready: Arc<AtomicBool>,
+    compatibility: Arc<AtomicU8>,
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
@@ -46,7 +47,21 @@ impl Monitor {
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Relaxed)
     }
+    /// 0: server support unknown, 1: supported, 2: unsupported.
+    pub fn compatibility(&self) -> u8 {
+        self.compatibility.load(Ordering::Relaxed)
+    }
     pub fn start(state: PathBuf, save: PathBuf, executable: PathBuf) -> Self {
+        Self::start_with_api(state, save, executable, None)
+    }
+    pub fn start_with_api(
+        state: PathBuf,
+        save: PathBuf,
+        executable: PathBuf,
+        api: Option<String>,
+    ) -> Self {
+        let compatibility = Arc::new(AtomicU8::new(0));
+        let support = compatibility.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         let ready = Arc::new(AtomicBool::new(false));
@@ -55,6 +70,64 @@ impl Monitor {
             let Ok(reader) = Reader::open(&executable) else {
                 return;
             };
+            if let Some(api) = api {
+                let stop = flag.clone();
+                let executable_hash = reader.executable_sha256.clone();
+                // Network checks never block or interrupt local capture.
+                thread::spawn(move || {
+                    let Ok(runtime) = tokio::runtime::Runtime::new() else {
+                        return;
+                    };
+                    runtime.block_on(async move {
+                        let Ok(client) = reqwest::Client::builder()
+                            .timeout(Duration::from_secs(5))
+                            .redirect(reqwest::redirect::Policy::none())
+                            .build()
+                        else {
+                            return;
+                        };
+                        while !stop.load(Ordering::Relaxed) {
+                            let result = async {
+                                let value: Value = client
+                                    .get(format!(
+                                        "{}/api/v1/talent-compatibility",
+                                        api.trim_end_matches('/')
+                                    ))
+                                    .send()
+                                    .await?
+                                    .error_for_status()?
+                                    .json()
+                                    .await?;
+                                Ok::<_, reqwest::Error>(value)
+                            }
+                            .await;
+                            let status = match result {
+                                Ok(value) => match value["executableSha256"].as_array() {
+                                    Some(hashes) => {
+                                        if hashes
+                                            .iter()
+                                            .any(|hash| hash.as_str() == Some(&executable_hash))
+                                        {
+                                            1
+                                        } else {
+                                            2
+                                        }
+                                    }
+                                    None => 0,
+                                },
+                                Err(_) => 0,
+                            };
+                            support.store(status, Ordering::Relaxed);
+                            for _ in 0..60 {
+                                if stop.load(Ordering::Relaxed) {
+                                    return;
+                                }
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                            }
+                        }
+                    });
+                });
+            }
             let Ok(source) = source_id(&save, &reader) else {
                 return;
             };
@@ -77,9 +150,16 @@ impl Monitor {
                     } else {
                         session.clone().context("Missing monitor session")?
                     };
-                    let next = snapshot["sourceSha256"]
-                        .as_str()
-                        .context("Missing native source hash")?;
+                    // Save nonces, achievements and counters can change on every write.
+                    // Retain actual build revisions so those writes cannot evict run-start state.
+                    let next = crate::sha256(
+                        serde_json::to_string(&json!({
+                            "classes": snapshot["classes"],
+                            "equipment": snapshot["equipment"],
+                            "clientBuild": snapshot["clientBuild"],
+                        }))?
+                        .as_bytes(),
+                    );
                     if !fresh && hash == next && now - persisted < 1000 {
                         previous = now;
                         return Ok(());
@@ -95,7 +175,7 @@ impl Monitor {
                     tx.commit()?;
                     ready_flag.store(true, Ordering::Relaxed);
                     session = Some(id);
-                    hash = next.into();
+                    hash = next;
                     previous = now;
                     persisted = now;
                     Ok(())
@@ -109,6 +189,7 @@ impl Monitor {
             }
         });
         Self {
+            compatibility,
             ready,
             stop,
             handle: Some(handle),

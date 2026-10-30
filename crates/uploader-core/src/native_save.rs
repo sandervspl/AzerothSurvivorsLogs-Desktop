@@ -65,7 +65,7 @@ fn class(text: &str) -> Result<u8> {
     }
     Ok(id)
 }
-/// Read-only: only talent/spec rows leave the desktop, never the key or full save.
+/// Read-only: only talent/spec and worn-equipment data leave the desktop, never the key or full save.
 pub struct Reader {
     key: Vec<u8>,
     pub executable_sha256: String,
@@ -136,9 +136,16 @@ impl Reader {
         }
         let mut classes = BTreeMap::new();
         let mut specs = BTreeMap::new();
+        let mut equipment = crate::native_equipment::Equipment::default();
         for line in std::str::from_utf8(&plain)?.lines() {
             let fields: Vec<_> = line.split('|').collect();
             match fields[0] {
+                "equip" => equipment.read(&fields)?,
+                "stars"
+                    if crate::native_equipment::Equipment::supported(&self.executable_sha256) =>
+                {
+                    equipment.read_stars(&fields)?
+                }
                 "talent" => {
                     if fields.len() != 4 {
                         bail!("Malformed native talent row");
@@ -183,7 +190,7 @@ impl Reader {
             bail!("Native spec has no corresponding talent row");
         }
         Ok(
-            json!({"schemaVersion":1,"kind":"azs-native-save","observedAt":chrono::Utc::now().timestamp_millis(),"sourceModifiedAt":modified,"sourceSha256":crate::sha256(&sealed),"executableSha256":self.executable_sha256,"clientBuild":self.client_build,"classes":allocations}),
+            json!({"schemaVersion":1,"kind":"azs-native-save","observedAt":chrono::Utc::now().timestamp_millis(),"sourceModifiedAt":modified,"sourceSha256":crate::sha256(&sealed),"executableSha256":self.executable_sha256,"clientBuild":self.client_build,"classes":allocations,"equipment":equipment.snapshot(&self.executable_sha256)}),
         )
     }
 }

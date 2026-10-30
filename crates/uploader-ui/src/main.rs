@@ -66,6 +66,7 @@ struct Uploader {
     _poll: Task<()>,
     native_monitor: Option<azs_uploader_core::native_history::Monitor>,
     native_history_ready: bool,
+    native_compatibility: u8,
     game_root: Option<PathBuf>,
     setup_status: String,
     setup_busy: bool,
@@ -160,10 +161,11 @@ impl Uploader {
                                             std::thread::spawn(move || drop(old));
                                         }
                                         this.native_monitor = native.map(|(save, exe)| {
-                                            azs_uploader_core::native_history::Monitor::start(
+                                            azs_uploader_core::native_history::Monitor::start_with_api(
                                                 this.state.clone(),
                                                 save,
                                                 exe,
+                                                Some(this.api.clone()),
                                             )
                                         });
                                     }
@@ -227,6 +229,11 @@ impl Uploader {
                             .native_monitor
                             .as_ref()
                             .is_some_and(|monitor| monitor.is_ready());
+                        let compatibility = this.native_monitor.as_ref().map_or(0, |monitor| monitor.compatibility());
+                        if compatibility != this.native_compatibility {
+                            this.native_compatibility = compatibility;
+                            cx.notify();
+                        }
                         if ready != this.native_history_ready {
                             this.native_history_ready = ready;
                             cx.notify();
@@ -275,6 +282,7 @@ impl Uploader {
             _poll: poll,
             native_monitor,
             native_history_ready: false,
+            native_compatibility: 0,
             game_root: None,
             setup_status: "Choose your game directory to get started.".into(),
             setup_busy: false,
@@ -380,10 +388,11 @@ impl Uploader {
                             azs_uploader_core::native_save::discover(this.recorder.as_deref())
                         {
                             this.native_monitor =
-                                Some(azs_uploader_core::native_history::Monitor::start(
+                                Some(azs_uploader_core::native_history::Monitor::start_with_api(
                                     this.state.clone(),
                                     save,
                                     exe,
+                                    Some(this.api.clone()),
                                 ));
                         }
                     } else {
@@ -1210,14 +1219,18 @@ impl Render for Uploader {
                     .child(source("combat", "Combat log", self.combat.as_ref(), "No combat log found"))
                     .child(source("recorder", "Recorder export", self.recorder.as_ref(), "No recorder export found")))
                 .child(div().p_4().bg(rgb(PANEL)).flex().flex_col().gap_2()
-                    .child("Talent history")
+                    .child("Build history")
                     .child(div().text_xs().text_color(rgb(if self.native_history_ready { 0x64d77a } else { MUTED }))
-                        .child(if self.native_history_ready { "Recording. Keep this app open while playing." } else { "Waiting for a readable game save." })))
+                        .child(if self.native_history_ready { match self.native_compatibility {
+                            1 => "Recording. Talent reports supported. Keep this app open while playing.",
+                            2 => "Recording locally. This game build needs talent verification on the server. Keep this app open; saved uploads can be recovered after support is added.",
+                            _ => "Recording locally. Server talent support has not been confirmed. Keep this app open while playing.",
+                        } } else { "Waiting for a readable game save." })))
                 .child(div().id("upload-help").text_xs().text_color(rgb(MUTED)).cursor_pointer()
                     .child(if self.show_help { "Hide upload instructions" } else { "Before you upload >" })
                     .on_click(cx.listener(|this, _, _, cx| { this.show_help = !this.show_help; cx.notify(); })))
                 .when(self.show_help, |s| s.child(div().w_full().min_w_0().whitespace_normal().text_xs().text_color(rgb(MUTED))
-                    .child("Exit the game normally before uploading so your latest run is saved. Recording files are discovered automatically. Keep this app open while playing to record talent history. Older runs are matched only where that history covers their start. Uploaded originals are deleted after 30 days; generated reports remain available.")))
+                    .child("Exit the game normally before uploading so your latest run is saved. Recording files are discovered automatically. Keep this app open while playing to record talent and equipment history. Older runs are matched only where that history covers their start. Uploaded originals are deleted after 30 days; generated reports remain available.")))
                 .when(self.signed_in && self.pending_count > 0, |s| s.child(
                     div().p_3().bg(rgb(PANEL)).flex().items_center().gap_3()
                         .child(div().flex_1().text_xs().text_color(rgb(MUTED)).child(format!("{} unfinished uploads saved on this computer.", self.pending_count)))

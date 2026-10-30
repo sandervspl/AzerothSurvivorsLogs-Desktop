@@ -2,6 +2,7 @@ pub mod client_build;
 pub mod distribution;
 pub mod game_process;
 pub mod monitoring;
+mod native_equipment;
 pub mod native_history;
 pub mod native_save;
 mod retention;
