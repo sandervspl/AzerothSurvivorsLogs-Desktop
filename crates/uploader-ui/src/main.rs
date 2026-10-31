@@ -2039,15 +2039,6 @@ fn main() {
     if let Err(error) = azs_uploader::recovery::startup(&state) {
         eprintln!("Update startup status: {error:#}");
     }
-    let update_error = desktop_updates::apply_on_safe_launch(&state, &args[1..])
-        .err()
-        .map(|e| format!("Update deferred: {e:#}"));
-    if let Some(error) = &update_error {
-        let _ = azs_uploader_core::distribution::atomic_json(
-            &state.join("desktop-update-status.json"),
-            &serde_json::json!({"status":"deferred","detail":error}),
-        );
-    }
     Application::new().run(move |cx: &mut App| {
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
@@ -2064,15 +2055,28 @@ fn main() {
             },
             |window, cx| {
                 window.set_window_title("Azeroth Survivors Recorder");
-                let uploader = cx.new(|cx| {
-                    let mut uploader = Uploader::new(api, state, cx);
-                    if let Some(error) = update_error {
-                        uploader.desktop_status = error;
-                    }
-                    uploader
-                });
-                let close_state = uploader.clone();
-                window.on_window_should_close(cx, move |window, cx| {
+                cx.new(|cx| Launch::new(api, state, args[1..].to_vec(), cx))
+            },
+        )
+        .expect("Cannot open uploader window");
+        cx.activate(true);
+    });
+}
+
+fn open_uploader(
+    api: String,
+    state: PathBuf,
+    status: String,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<Uploader> {
+    let uploader = cx.new(|cx| {
+        let mut uploader = Uploader::new(api, state, cx);
+        uploader.desktop_status = status;
+        uploader
+    });
+    let close_state = uploader.clone();
+    window.on_window_should_close(cx, move |window, cx| {
                     close_state.update(cx, |this, cx| {
                         match this.close_behavior.to_tray {
                             Some(false) => { azs_uploader::recovery::clean_exit(&this.state); true }
@@ -2096,10 +2100,150 @@ fn main() {
                         }
                     })
                 });
-                uploader
-            },
-        )
-        .expect("Cannot open uploader window");
-        cx.activate(true);
-    });
+    uploader
+}
+
+struct Launch {
+    api: String,
+    state: PathBuf,
+    args: Vec<String>,
+    status: String,
+    busy: bool,
+    complete: bool,
+    uploader: Option<Entity<Uploader>>,
+}
+impl Launch {
+    fn new(api: String, state: PathBuf, args: Vec<String>, cx: &mut Context<Self>) -> Self {
+        let mut view = Self {
+            api,
+            state,
+            args,
+            status: "Checking for uploader updates...".into(),
+            busy: false,
+            complete: false,
+            uploader: None,
+        };
+        view.check(cx);
+        view
+    }
+    fn check(&mut self, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        self.busy = true;
+        self.status = "Checking for uploader updates...".into();
+        let state = self.state.clone();
+        let args = self.args.clone();
+        let (tx, rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = desktop_updates::launch(&state, &args, &tx)
+                .map_err(|e| format!("The uploader could not update: {e:#}"));
+            if let Err(error) = &result {
+                let _ = azs_uploader_core::distribution::atomic_json(
+                    &state.join("desktop-update-status.json"),
+                    &serde_json::json!({"status":"deferred","detail":error}),
+                );
+            }
+            let _ = done_tx.send(result);
+        });
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(100)).await;
+                let status = rx.try_iter().last();
+                let result = done_rx.try_recv();
+                let finished = !matches!(result, Err(mpsc::TryRecvError::Empty));
+                if this.update(cx, |this, cx| {
+                    if let Some(status) = status { this.status = status; }
+                    match result {
+                        Ok(Ok(status)) => { this.status = status; this.complete = true; this.busy = false; }
+                        Ok(Err(error)) => { this.status = error; this.busy = false; }
+                        Err(mpsc::TryRecvError::Disconnected) => { this.status = "The update check stopped unexpectedly. Retry or continue with the installed version.".into(); this.busy = false; }
+                        _ => {}
+                    }
+                    cx.notify();
+                }).is_err() || finished { break; }
+            }
+        }).detach();
+        cx.notify();
+    }
+}
+impl Render for Launch {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.complete && self.uploader.is_none() {
+            self.uploader = Some(open_uploader(
+                self.api.clone(),
+                self.state.clone(),
+                self.status.clone(),
+                window,
+                cx,
+            ));
+        }
+        if let Some(uploader) = &self.uploader {
+            return div().size_full().child(uploader.clone()).into_any_element();
+        }
+        div()
+            .size_full()
+            .p_8()
+            .flex()
+            .flex_col()
+            .justify_center()
+            .gap_5()
+            .bg(rgb(palette::PAGE))
+            .text_color(rgb(palette::TEXT))
+            .child(div().text_2xl().child(if self.busy {
+                "Getting your uploader ready"
+            } else {
+                "Update needs attention"
+            }))
+            .when(self.busy, |view| view.child(approval_spinner()))
+            .child(self.status.clone())
+            .when(!self.busy, |view| {
+                view.child(
+                    startup_button("retry-startup-update", "Retry update", true, true)
+                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                this.check(cx);
+                            }
+                        }))
+                        .on_click(cx.listener(|this, _, _, cx| this.check(cx))),
+                )
+                .child(
+                    startup_button(
+                        "continue-startup",
+                        "Continue with installed version",
+                        false,
+                        true,
+                    )
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            this.complete = true;
+                            cx.notify();
+                        }
+                    }))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.complete = true;
+                        cx.notify();
+                    })),
+                )
+            })
+            .into_any_element()
+    }
+}
+
+fn startup_button(id: &'static str, label: &str, primary: bool, _: bool) -> Stateful<Div> {
+    div()
+        .id(id)
+        .tab_index(0)
+        .px_4()
+        .py_2()
+        .rounded_sm()
+        .cursor_pointer()
+        .bg(rgb(if primary {
+            palette::ACCENT
+        } else {
+            palette::RAISED
+        }))
+        .focus(|s| s.border_1().border_color(rgb(palette::LINK)))
+        .child(label.to_string())
 }

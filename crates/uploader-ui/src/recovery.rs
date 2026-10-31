@@ -463,3 +463,12 @@ pub fn record_guard_error(plan_path: &Path, error: &anyhow::Error) {
         &serde_json::json!({"status":"repair-required","version":plan.old_version,"failedVersion":plan.new_version,"detail":format!("{error:#}")}),
     );
 }
+
+/// A candidate already being assessed must not wait on another network check.
+pub fn awaiting_health(state: &Path) -> Result<bool> {
+    let Some(plan) = attempt(state)? else {
+        return Ok(false);
+    };
+    let locator = auto_locate_app_manifest(LocationContext::FromCurrentExe)?;
+    Ok(locator.get_manifest_version_full_string() == plan.new_version)
+}

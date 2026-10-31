@@ -164,6 +164,9 @@ fn approved(state: &Path) -> Result<Option<(UpdateManager, DesktopRelease, PathB
     Ok(Some((manager, release, package)))
 }
 pub fn prepare(state: &Path) -> Result<String> {
+    prepare_with_status(state, |_| {})
+}
+fn prepare_with_status(state: &Path, status: impl Fn(String)) -> Result<String> {
     let _lock = lock(&state.join("release.lock"))?;
     let Some((manager, release, package)) = approved(state)? else {
         return Ok("Installer-managed updates are available in installed builds.".into());
@@ -176,6 +179,10 @@ pub fn prepare(state: &Path) -> Result<String> {
     }
     match manager.check_for_updates()? {
         UpdateCheck::UpdateAvailable(update) => {
+            status(format!(
+                "Downloading and verifying uploader {}...",
+                release.version
+            ));
             manager.download_updates(&update, None)?;
             verified_file(&package, &release)?;
             Ok(format!(
@@ -191,10 +198,10 @@ pub fn prepare(state: &Path) -> Result<String> {
 }
 /// Startup-only handoff. No native monitoring or upload can have started yet.
 pub fn apply_on_safe_launch(state: &Path, restart_args: &[String]) -> Result<()> {
-    if !state.is_dir() || Settings::load(state)?.is_some_and(|s| s.updates_paused) {
+    if !state.is_dir() {
         return Ok(());
     }
-    // Do not put network latency on an ordinary launch without a staged update.
+    // Only replace authenticated staged packages, with recovery armed first.
     let manager = match UpdateManager::new(velopack::sources::NoneSource {}, None, None) {
         Ok(manager) => manager,
         Err(velopack::Error::NotInstalled(_)) => return Ok(()),
@@ -230,7 +237,7 @@ pub fn apply_on_safe_launch(state: &Path, restart_args: &[String]) -> Result<()>
     }
     azs_uploader_core::game_process::ensure_closed()?;
     azs_uploader::recovery::arm(state, &release.version, restart_args)?;
-    if let Err(error) = manager.wait_exit_then_apply_updates(pending, true, true, restart_args) {
+    if let Err(error) = manager.wait_exit_then_apply_updates(pending, false, true, restart_args) {
         azs_uploader::recovery::cancel(state);
         return Err(error)
             .context("Cannot start desktop update; the current version is still available");
@@ -238,4 +245,24 @@ pub fn apply_on_safe_launch(state: &Path, restart_args: &[String]) -> Result<()>
     // Release our application/state locks before the helper replaces files.
     drop(_lock);
     std::process::exit(0);
+}
+
+/// Check every ordinary launch, independently of recorder update preferences.
+pub fn launch(state: &Path, args: &[String], status: &Sender<String>) -> Result<String> {
+    // A restarted candidate must reach the real UI promptly for the recovery guard.
+    if azs_uploader::recovery::awaiting_health(state)? {
+        return Ok("Uploader updated. Startup recovery is checking this version.".into());
+    }
+    let _ = status.send("Checking for uploader updates...".into());
+    let summary = prepare_with_status(state, |message| {
+        let _ = status.send(message);
+    })?;
+    if ready() {
+        let _ =
+            status.send("Installing uploader update... The app will restart automatically.".into());
+        // Allow the UI polling boundary to paint the installation state before exit.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        apply_on_safe_launch(state, args)?;
+    }
+    Ok(summary)
 }
