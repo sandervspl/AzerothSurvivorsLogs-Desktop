@@ -116,6 +116,22 @@ impl Engine {
         db.busy_timeout(Duration::from_secs(5))?;
         Ok(db)
     }
+    pub async fn uploader_banner(&self, api: &str) -> Result<Option<String>> {
+        let value = checked(
+            self.client
+                .get(format!("{}/api/v1/uploader-banner", validate_api(api)?))
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await?,
+        )
+        .await?;
+        let enabled = value["enabled"].as_bool().context("Missing banner state")?;
+        let message = value["message"]
+            .as_str()
+            .context("Missing banner message")?;
+        anyhow::ensure!(message.chars().count() <= 1000, "Banner too long");
+        Ok((enabled && !message.trim().is_empty()).then(|| message.to_string()))
+    }
     pub async fn application_origin(&self, api: &str) -> Result<String> {
         let config = checked(
             self.client

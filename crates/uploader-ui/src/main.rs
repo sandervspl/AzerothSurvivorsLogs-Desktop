@@ -20,6 +20,7 @@ enum Tab {
 }
 
 enum Message {
+    Banner(Option<String>),
     DesktopStatus(String),
     Setup(Box<setup::Snapshot>),
     GameState(game_process::State),
@@ -86,6 +87,7 @@ struct Uploader {
     setup_sender: mpsc::Sender<setup::Command>,
     native_source: Option<(PathBuf, Option<std::time::SystemTime>)>,
     manual_sources: bool,
+    banner: Option<String>,
     desktop_status: String,
     health_reported: bool,
 }
@@ -113,6 +115,28 @@ impl Uploader {
                     previous = Some(state);
                 }
                 std::thread::sleep(Duration::from_secs(1));
+            }
+        });
+        let banner_api = api.clone();
+        let banner_state = state.clone();
+        let banner_sender = sender.clone();
+        std::thread::spawn(move || {
+            let Ok(runtime) = tokio::runtime::Runtime::new() else {
+                return;
+            };
+            let Ok(engine) = Engine::new(banner_state) else {
+                return;
+            };
+            loop {
+                // Clear stale announcements on failure; uploads and recording continue independently.
+                let message = runtime
+                    .block_on(engine.uploader_banner(&banner_api))
+                    .ok()
+                    .flatten();
+                if banner_sender.send(Message::Banner(message)).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_secs(30));
             }
         });
         let session_api = api.clone();
@@ -145,6 +169,7 @@ impl Uploader {
                         }
                         while let Ok(message) = this.receiver.try_recv() {
                             match message {
+                                Message::Banner(message) => this.banner = message,
                                 Message::DesktopStatus(status) => this.desktop_status = status,
                                 Message::Setup(snapshot) => {
                                     this.setup_loaded = true;
@@ -338,6 +363,7 @@ impl Uploader {
             native_source: None,
             manual_sources: false,
             desktop_status: "Uploader updates are checked automatically.".into(),
+            banner: None,
             health_reported: false,
         }
     }
@@ -1577,6 +1603,10 @@ impl Render for Uploader {
                             .overflow_y_scroll()
                             .track_scroll(&self.page_scroll)
                             .p_6()
+                            .when_some(self.banner.clone(), |s, message| s.child(
+                                div().w_full().min_w_0().p_4().mb_4().rounded_sm()
+                                    .border_1().border_color(rgb(ACCENT)).bg(rgb(PANEL))
+                                    .whitespace_normal().child(message)))
                             .child(content),
                     )
                     .child(wheel_capture)
