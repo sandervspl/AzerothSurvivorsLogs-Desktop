@@ -91,6 +91,35 @@ struct Uploader {
     desktop_status: String,
     health_reported: bool,
 }
+struct StartupCapture {
+    monitor: azs_uploader_core::native_history::Monitor,
+    source: (PathBuf, Option<std::time::SystemTime>),
+}
+impl StartupCapture {
+    fn start(api: &str, state: &std::path::Path) -> Option<Self> {
+        let settings = azs_uploader_core::distribution::Settings::load(state)
+            .ok()
+            .flatten();
+        let (save, exe) = azs_uploader_core::native_save::discover(
+            settings
+                .as_ref()
+                .map(|settings| settings.game_root.as_path()),
+        )?;
+        let source = (
+            exe.clone(),
+            std::fs::metadata(&exe).and_then(|m| m.modified()).ok(),
+        );
+        Some(Self {
+            monitor: azs_uploader_core::native_history::Monitor::start_with_api(
+                state.to_path_buf(),
+                save,
+                exe,
+                Some(api.to_owned()),
+            ),
+            source,
+        })
+    }
+}
 fn credential(api: &str) -> anyhow::Result<keyring::Entry> {
     Ok(keyring::Entry::new(
         "AzerothSurvivorsRecorder",
@@ -98,7 +127,12 @@ fn credential(api: &str) -> anyhow::Result<keyring::Entry> {
     )?)
 }
 impl Uploader {
-    fn new(api: String, state: PathBuf, cx: &mut Context<Self>) -> Self {
+    fn new(
+        api: String,
+        state: PathBuf,
+        native: Option<StartupCapture>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let combat = None;
         let recorder = None;
         let (sender, receiver) = mpsc::channel();
@@ -181,11 +215,9 @@ impl Uploader {
                                         this.combat = snapshot.combat;
                                         this.recorder = snapshot.recorder;
                                     }
-                                    let native = this.game_root.as_ref().and_then(|root| {
-                                        azs_uploader_core::native_save::discover(Some(
-                                            root.as_path(),
-                                        ))
-                                    });
+                                    let native = azs_uploader_core::native_save::discover(
+                                        this.game_root.as_deref(),
+                                    );
                                     let tag = native.as_ref().map(|(_, exe)| {
                                         (
                                             exe.clone(),
@@ -308,7 +340,10 @@ impl Uploader {
                 }
             }
         });
-        let native_monitor = None;
+        let (native_monitor, native_source) = match native {
+            Some(native) => (Some(native.monitor), Some(native.source)),
+            None => (None, None),
+        };
         Self {
             close_behavior: close_behavior::CloseBehavior::load(&state),
             close_prompt_open: false,
@@ -360,7 +395,7 @@ impl Uploader {
             setup_busy: false,
             updates_paused: false,
             setup_sender,
-            native_source: None,
+            native_source,
             manual_sources: false,
             desktop_status: "Uploader updates are checked automatically.".into(),
             banner: None,
@@ -2097,11 +2132,12 @@ fn open_uploader(
     api: String,
     state: PathBuf,
     status: String,
+    native: Option<StartupCapture>,
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<Uploader> {
     let uploader = cx.new(|cx| {
-        let mut uploader = Uploader::new(api, state, cx);
+        let mut uploader = Uploader::new(api, state, native, cx);
         uploader.desktop_status = status;
         uploader
     });
@@ -2141,9 +2177,13 @@ struct Launch {
     busy: bool,
     complete: bool,
     uploader: Option<Entity<Uploader>>,
+    native: Option<StartupCapture>,
 }
 impl Launch {
     fn new(api: String, state: PathBuf, args: Vec<String>, cx: &mut Context<Self>) -> Self {
+        // Capture locally before update checks, sign-in or addon downloads can wait on the network.
+        // Transfer this exact monitor into the uploader to preserve uninterrupted coverage.
+        let native = StartupCapture::start(&api, &state);
         let mut view = Self {
             api,
             state,
@@ -2152,6 +2192,7 @@ impl Launch {
             busy: false,
             complete: false,
             uploader: None,
+            native,
         };
         view.check(cx);
         view
@@ -2205,6 +2246,7 @@ impl Render for Launch {
                 self.api.clone(),
                 self.state.clone(),
                 self.status.clone(),
+                self.native.take(),
                 window,
                 cx,
             ));

@@ -74,44 +74,46 @@ pub fn extract(bytes: &[u8]) -> Option<Value> {
             if chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_err() {
                 continue;
             }
-            let short = &bytes[end - 18..end - 10];
-            let commit = &bytes[end - 58..end - 18];
-            if !commit.iter().all(u8::is_ascii_hexdigit) || short != &commit[..8] {
-                continue;
+            for short_len in 7..=40 {
+                let short = &bytes[end - 10 - short_len..end - 10];
+                let commit = &bytes[end - 50 - short_len..end - 10 - short_len];
+                if !commit.iter().all(u8::is_ascii_hexdigit) || short != &commit[..short_len] {
+                    continue;
+                }
+                let commit_at = end - 50 - short_len;
+                let Some(start) = bytes[commit_at - 128..commit_at]
+                    .iter()
+                    .rposition(|byte| *byte == b'v')
+                    .map(|at| at + commit_at - 128)
+                else {
+                    continue;
+                };
+                let Ok(build) = std::str::from_utf8(&bytes[start..commit_at]) else {
+                    continue;
+                };
+                let Some((tag, suffix)) = build[1..].split_once('-') else {
+                    continue;
+                };
+                let Some((distance, hash)) = suffix.split_once("-g") else {
+                    continue;
+                };
+                if semver::Version::parse(tag).is_err()
+                    || distance.parse::<u64>().is_err()
+                    || hash.as_bytes() != short
+                    || start < tag.len()
+                    || &bytes[start - tag.len()..start] != tag.as_bytes()
+                {
+                    continue;
+                }
+                matches.push(json!({
+                    "gameVersion": release.as_ref().map(|(version, _)| version),
+                    "packageVersion": tag, "gameBuild": build,
+                    "releaseVersionOffset": release.as_ref().map(|(_, offset)| offset),
+                    "commit": std::str::from_utf8(commit).ok()?, "buildDate": date,
+                    "profile": std::str::from_utf8(&profile[..profile.len()-1]).ok()?,
+                    "metadataOffset": start - tag.len(),
+                }));
             }
-            let commit_at = end - 58;
-            let Some(start) = bytes[commit_at - 128..commit_at]
-                .iter()
-                .rposition(|byte| *byte == b'v')
-                .map(|at| at + commit_at - 128)
-            else {
-                continue;
-            };
-            let Ok(build) = std::str::from_utf8(&bytes[start..commit_at]) else {
-                continue;
-            };
-            let Some((tag, suffix)) = build[1..].split_once('-') else {
-                continue;
-            };
-            let Some((distance, hash)) = suffix.split_once("-g") else {
-                continue;
-            };
-            if semver::Version::parse(tag).is_err()
-                || distance.parse::<u64>().is_err()
-                || hash.as_bytes() != short
-                || start < tag.len()
-                || &bytes[start - tag.len()..start] != tag.as_bytes()
-            {
-                continue;
-            }
-            matches.push(json!({
-                "gameVersion": release.as_ref().map(|(version, _)| version),
-                "packageVersion": tag, "gameBuild": build,
-                "releaseVersionOffset": release.as_ref().map(|(_, offset)| offset),
-                "commit": std::str::from_utf8(commit).ok()?, "buildDate": date,
-                "profile": std::str::from_utf8(&profile[..profile.len()-1]).ok()?,
-                "metadataOffset": start - tag.len(),
-            }));
         }
     }
     if matches.len() == 1 {

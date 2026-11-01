@@ -102,6 +102,7 @@ impl Monitor {
                             }
                             .await;
                             let status = match result {
+                                Ok(value) if value["validation"] == "class-keys-and-ranks" => 1,
                                 Ok(value) => match value["executableSha256"].as_array() {
                                     Some(hashes) => {
                                         if hashes
