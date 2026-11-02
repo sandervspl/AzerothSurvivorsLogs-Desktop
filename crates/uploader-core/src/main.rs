@@ -122,7 +122,7 @@ async fn run() -> Result<()> {
                 .map(str::parse)
                 .transpose()?
                 .unwrap_or(chrono::Local::now().offset().local_minus_utc() / 60);
-            let job = engine.stage(StageOptions {
+            let jobs = engine.stage_many(StageOptions {
                 api,
                 owner: &owner,
                 combat,
@@ -136,10 +136,12 @@ async fn run() -> Result<()> {
                 offset,
                 visibility: option("--visibility").unwrap_or("public"),
             })?;
-            if command == "stage" {
-                println!("{}", serde_json::to_string(&job)?);
-            } else {
-                println!("{}", engine.upload(&job, &token, progress).await?);
+            for job in jobs {
+                if command == "stage" {
+                    println!("{}", serde_json::to_string(&job)?);
+                } else {
+                    println!("{}", engine.upload(&job, &token, progress).await?);
+                }
             }
         }
         "resume" => {

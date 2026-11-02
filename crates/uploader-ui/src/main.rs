@@ -828,20 +828,18 @@ impl Uploader {
                             .filter(|j| j.api == api && j.owner == owner)
                             .collect()
                     } else {
-                        vec![
-                            engine.stage(StageOptions {
-                                api: &api,
-                                owner: &owner,
-                                combat: combat.as_ref().unwrap(),
-                                recorder: recorder.as_deref(),
-                                native_save: native
-                                    .as_ref()
-                                    .map(|(save, exe)| (save.as_path(), exe.as_path())),
-                                year: chrono::Local::now().year(),
-                                offset: chrono::Local::now().offset().local_minus_utc() / 60,
-                                visibility,
-                            })?,
-                        ]
+                        engine.stage_many(StageOptions {
+                            api: &api,
+                            owner: &owner,
+                            combat: combat.as_ref().unwrap(),
+                            recorder: recorder.as_deref(),
+                            native_save: native
+                                .as_ref()
+                                .map(|(save, exe)| (save.as_path(), exe.as_path())),
+                            year: chrono::Local::now().year(),
+                            offset: chrono::Local::now().offset().local_minus_utc() / 60,
+                            visibility,
+                        })?
                     };
                     let mut reports = vec![];
                     let mut failures = vec![];

@@ -5,6 +5,7 @@ pub mod monitoring;
 mod native_equipment;
 pub mod native_history;
 pub mod native_save;
+mod recorder_parts;
 mod retention;
 mod run_filter;
 use anyhow::{Context, Result, bail};
@@ -44,11 +45,14 @@ pub struct Job {
     pub api: String,
     pub owner: String,
     pub manifest: Manifest,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub partitioned: bool,
 }
 pub struct Engine {
     state: PathBuf,
     client: reqwest::Client,
 }
+#[derive(Clone, Copy)]
 pub struct StageOptions<'a> {
     pub api: &'a str,
     pub owner: &'a str,
@@ -160,7 +164,90 @@ impl Engine {
             .context("API returned no account")?
             .into())
     }
+    pub fn stage_many(&self, options: StageOptions<'_>) -> Result<Vec<Job>> {
+        let Some(recorder) = options.recorder else {
+            return Ok(vec![self.stage(options)?]);
+        };
+        if fs::metadata(recorder)?.len() <= 16 * 1024 * 1024
+            && fs::metadata(options.combat)?.len() <= 16 * 1024 * 1024
+        {
+            return Ok(vec![self.stage(options)?]);
+        }
+        // Partition before snapshot's file limits. Read only one run into memory
+        // at a time and validate the whole source before creating queue entries.
+        let parts = recorder_parts::split(recorder, &self.state.join("spool"))?;
+        let filename = recorder
+            .file_name()
+            .context("Invalid source name")?
+            .to_string_lossy();
+        let combat_filename = options
+            .combat
+            .file_name()
+            .context("Invalid source name")?
+            .to_string_lossy();
+        let jobs = parts
+            .iter()
+            .map(|part| {
+                let mut combat = tempfile::NamedTempFile::new_in(self.state.join("spool"))?;
+                let year = run_filter::combat_part(
+                    options.combat,
+                    part.start,
+                    part.end,
+                    options.year,
+                    options.offset,
+                    &mut combat,
+                )?;
+                if combat.as_file().metadata()?.len() == 0 {
+                    combat.write_all(b"\n")?;
+                }
+                combat.as_file().sync_all()?;
+                self.stage_source(
+                    StageOptions {
+                        recorder: Some(part.file.path()),
+                        combat: combat.path(),
+                        year,
+                        ..options
+                    },
+                    Some((&combat_filename, &filename)),
+                    false,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if !is_local_api(&reqwest::Url::parse(options.api)?)
+            && jobs.iter().any(|job| !job.manifest.sources.is_empty())
+            && !jobs.iter().any(|job| {
+                job.manifest
+                    .sources
+                    .iter()
+                    .any(|source| source.kind == "combat" && source.original_bytes > 1)
+            })
+        {
+            bail!(
+                "No combat events match the recorder. Select the matching combat log and check the recording year and time zone; no files were uploaded."
+            );
+        }
+        let mut db = self.db()?;
+        let tx = db.transaction()?;
+        for job in &jobs {
+            if !job.manifest.sources.is_empty() {
+                tx.execute(
+                    "INSERT OR IGNORE INTO jobs (id, payload, status) VALUES (?, ?, 'pending')",
+                    params![job.id, serde_json::to_string(job)?],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(jobs)
+    }
     pub fn stage(&self, options: StageOptions<'_>) -> Result<Job> {
+        self.stage_source(options, None, true)
+    }
+    fn stage_source(
+        &self,
+        options: StageOptions<'_>,
+        source_names: Option<(&str, &str)>,
+        queue: bool,
+    ) -> Result<Job> {
         let StageOptions {
             api,
             owner,
@@ -179,8 +266,15 @@ impl Engine {
             bail!("Invalid visibility");
         }
         let mut sources = vec![self.snapshot(combat, "combat")?];
+        if let Some((filename, _)) = source_names {
+            sources[0].filename = filename.into();
+        }
         if let Some(path) = recorder {
-            sources.push(self.snapshot(path, "recorder")?);
+            let mut source = self.snapshot(path, "recorder")?;
+            if let Some((_, filename)) = source_names {
+                source.filename = filename.into();
+            }
+            sources.push(source);
         }
         if let Some((save, exe)) = native_save {
             let data = native_history::bundle(&self.state, save, exe)?;
@@ -211,6 +305,7 @@ impl Engine {
             api,
             owner: owner.into(),
             manifest,
+            partitioned: !queue,
         };
         let job = self.filter_job(&job)?.unwrap_or(Job {
             manifest: Manifest {
@@ -222,10 +317,12 @@ impl Engine {
         if job.manifest.sources.is_empty() {
             return Ok(job);
         }
-        self.db()?.execute(
-            "INSERT OR IGNORE INTO jobs (id, payload, status) VALUES (?, ?, 'pending')",
-            params![id, serde_json::to_string(&job)?],
-        )?;
+        if queue {
+            self.db()?.execute(
+                "INSERT OR IGNORE INTO jobs (id, payload, status) VALUES (?, ?, 'pending')",
+                params![id, serde_json::to_string(&job)?],
+            )?;
+        }
         Ok(job)
     }
     fn filter_job(&self, job: &Job) -> Result<Option<Job>> {
@@ -265,6 +362,7 @@ impl Engine {
             recorder.as_deref(),
             job.manifest.year,
             job.manifest.utc_offset_minutes,
+            job.partitioned,
         )?;
         if filtered.ignored {
             return Ok(None);
@@ -302,9 +400,6 @@ impl Engine {
         let before = file.metadata()?;
         if before.len() == 0 || before.len() > 128 * 1024 * 1024 {
             bail!("Source must be between 1 byte and 128 MiB");
-        }
-        if kind == "recorder" && before.len() > 16 * 1024 * 1024 {
-            bail!("Recorder exceeds 16 MiB");
         }
         if kind == "recorder" {
             let mut header = [0u8; 64 * 1024];

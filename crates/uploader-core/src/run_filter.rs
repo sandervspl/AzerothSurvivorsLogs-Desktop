@@ -175,6 +175,21 @@ impl Reader<'_> {
     }
 }
 
+pub(crate) fn literal(bytes: &[u8]) -> Result<Value> {
+    let mut reader = Reader {
+        bytes,
+        pos: 0,
+        nodes: 0,
+    };
+    let value = reader.value(0)?;
+    reader.skip();
+    ensure!(
+        reader.pos == bytes.len(),
+        "Executable content after recorder value"
+    );
+    Ok(value)
+}
+
 fn ordered(value: &Value) -> Result<Vec<&Value>> {
     let mut entries = value
         .as_object()
@@ -230,7 +245,68 @@ pub struct Filtered {
     pub ignored: bool,
     pub year: i32,
 }
-pub fn filter(combat: &[u8], recorder: Option<&[u8]>, year: i32, offset: i32) -> Result<Filtered> {
+
+// Slice a growing combat log without applying an upload-size limit to its
+// accumulated history. Use the same clock conversion as remote filtering.
+pub(crate) fn combat_part(
+    path: &std::path::Path,
+    start: f64,
+    end: f64,
+    mut year: i32,
+    offset: i32,
+    output: &mut impl std::io::Write,
+) -> Result<i32> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path)?;
+    let before = file.metadata()?;
+    let mut input = std::io::BufReader::new(file);
+    let mut previous = None;
+    let mut first_year = None;
+    let mut bytes = Vec::new();
+    loop {
+        bytes.clear();
+        // Bound a single malformed line, not the size of the history file.
+        let count =
+            std::io::Read::take(&mut input, 1024 * 1024 + 1).read_until(b'\n', &mut bytes)?;
+        if count == 0 {
+            break;
+        }
+        ensure!(count <= 1024 * 1024, "Combat log line exceeds limit");
+        let line = std::str::from_utf8(&bytes).context("Combat log is not UTF-8")?;
+        let Some((stamp, _)) = line.split_once("  ") else {
+            continue;
+        };
+        let Ok(mut date) =
+            NaiveDateTime::parse_from_str(&format!("{year}/{stamp}"), "%Y/%m/%d %H:%M:%S%.f")
+        else {
+            continue;
+        };
+        if previous.is_some_and(|last| date.and_utc().timestamp_millis() < last - 86400000) {
+            year += 1;
+            date = date.with_year(year).context("Invalid year rollover")?;
+        }
+        previous = Some(date.and_utc().timestamp_millis());
+        let time = date.and_utc().timestamp_millis() as f64 - f64::from(offset) * 60000.0;
+        if time >= start && time <= end {
+            first_year.get_or_insert(year);
+            output.write_all(&bytes)?;
+        }
+    }
+    let after = input.get_ref().metadata()?;
+    ensure!(
+        before.len() == after.len() && before.modified()? == after.modified()?,
+        "Source changed while copying; save and retry"
+    );
+    Ok(first_year.unwrap_or(year))
+}
+
+pub fn filter(
+    combat: &[u8],
+    recorder: Option<&[u8]>,
+    year: i32,
+    offset: i32,
+    allow_missing_combat: bool,
+) -> Result<Filtered> {
     let mut intervals = Vec::new();
     let recorder = if let Some(bytes) = recorder {
         let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
@@ -376,10 +452,13 @@ pub fn filter(combat: &[u8], recorder: Option<&[u8]>, year: i32, offset: i32) ->
             }
         }
     }
-    if qualifies && out.is_empty() {
+    if qualifies && out.is_empty() && !allow_missing_combat {
         bail!(
             "No combat events match the recorder. Select the matching combat log and check the recording year and time zone; no files were uploaded."
         );
+    }
+    if qualifies && out.is_empty() {
+        out.push(b'\n');
     }
     Ok(Filtered {
         combat: out,
